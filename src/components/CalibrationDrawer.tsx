@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { SimController } from '../hooks/useSimulation'
 import { STORAGE_KEY } from '../hooks/paramStore'
 import { computeBalance, pickChoices, autoPickK, tankForecast } from '../sim/balance'
-import { HDPE } from '../sim/physics'
+import { HDPE, levelDropFor } from '../sim/physics'
 import { PRESETS } from '../sim/params'
 import { fmt, fmtMs } from './format'
 import { ParamSlider, Select } from './controls'
@@ -46,8 +46,9 @@ export function CalibrationDrawer({ c, open, onClose }: { c: SimController; open
   if (!open) return null
 
   const machine = b.pressCycle
-  const choices = pickChoices(p.slots)
-  const auto = autoPickK(p.slots)
+  const drop = levelDropFor(p.bathPods, p.slots)
+  const choices = pickChoices(p.slots, drop)
+  const auto = autoPickK(p.slots, drop)
 
   const download = () => {
     const json = c.exportParams()
@@ -245,6 +246,14 @@ export function CalibrationDrawer({ c, open, onClose }: { c: SimController; open
                 label="Posiciones del carrusel"
                 unit="pos."
                 hint={`Paso angular ${fmt(360 / p.slots, 2)}° · reinicia la simulación`}
+              />
+              <ParamSlider
+                k="bathPods"
+                params={p}
+                set={set}
+                label="Vainas en la glicerina a la vez"
+                unit="vainas"
+                hint={`Las resistencias del fondo bajan el nivel ${fmt(drop, 0)} mm por debajo del eje (8 = al ras) · reinicia la simulación`}
               />
               <Select
                 label="Estación de RETIRO (ángulo de salida del baño)"

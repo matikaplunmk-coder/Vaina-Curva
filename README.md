@@ -39,7 +39,11 @@ enclavamientos, balance y un test de interfaz en jsdom).
 - `sequence.ts`: la estación en L como lógica pura: pasos, cilindros (matriz, mordaza, mandril), finales de carrera,
   enclavamientos del PLC y fuerza de la mordaza.
 - `physics.ts`: modelos térmicos de primer orden T(t) = T∞ + (T₀ − T∞)·e^(−t/τ):
-  - batea de glicerina: la fracción sumergida de cada caño depende de su ángulo (líquido hasta el nivel del eje);
+  - batea de glicerina: la fracción sumergida de cada caño depende de su ángulo y del nivel del líquido. Las resistencias
+    ocupan el fondo, así que el carrusel no queda al ras: el parámetro **«Vainas en la glicerina a la vez»** (pestaña C ·
+    Mecánica, 6–8, nominal **7,5**) cuenta vainas equivalentes (una a medias en la superficie vale 0,5; 8 = nivel en el eje)
+    y baja el nivel de la glicerina por debajo del eje. Con 7–8 vainas el ciclo sigue siendo el de la prensa (22,9 s); por
+    debajo de ~7,3 el carrusel pasa a ser el cuello de botella (6,5 vainas → 25,4 s). Reinicia la simulación;
     sumergido τ = 75 s (a 2,5 mm, escala con el espesor), al aire τ = 5000 s;
     la glicerina tiene su propio balance (resistencias de 6 kW con control proporcional, calor cedido a los caños, pérdidas);
   - arrastre: cada caño retirado se lleva ~3 ml de glicerina que terminan en el agua de lavado (dilución en el tanque);

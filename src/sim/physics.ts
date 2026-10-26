@@ -86,9 +86,50 @@ export const EMERGED_TAU = 5000
  * sentido horario). El líquido llega al nivel del eje: por debajo, sumergido; en ±90° el caño
  * queda a medias en la superficie.
  */
-export function submergedFraction(angleDeg: number): number {
-  const depth = -BATH.mountRadius * Math.cos((angleDeg * Math.PI) / 180) // mm bajo el nivel
+export function submergedFraction(angleDeg: number, levelDrop = 0): number {
+  const depth = -BATH.mountRadius * Math.cos((angleDeg * Math.PI) / 180) - levelDrop // mm bajo el nivel
   return Math.min(1, Math.max(0, depth / PIPE.od + 0.5))
+}
+
+/** Vainas en la glicerina a la vez cuando el nivel llega justo al eje (media circunferencia). */
+export const BATH_PODS_AT_AXIS = 8
+
+/** Vainas equivalentes en la glicerina (Σ fracción sumergida de las `n` posiciones) con el nivel `drop` mm bajo el eje. */
+function podsAtLevel(n: number, drop: number): number {
+  let sum = 0
+  for (let k = 0; k < n; k++) sum += submergedFraction((k * 360) / n, drop)
+  return sum
+}
+
+const dropCache = new Map<string, number>()
+
+/**
+ * Cuánto queda el nivel de la glicerina por debajo del eje del carrusel [mm] para que entren
+ * `pods` vainas a la vez en la batea de `n` posiciones. Las resistencias ocupan el fondo, así que
+ * el carrusel no queda al ras. `pods` cuenta vainas equivalentes (Σ fracción sumergida: una vaina
+ * a medias en la superficie cuenta 0,5); con el nivel en el eje entran 8 de 16. Se busca por
+ * bisección porque las posiciones son discretas y el caño tiene 40 mm de diámetro. El nivel nunca
+ * sube del eje: pedir 8 o más da 0.
+ */
+export function levelDropFor(pods: number, n: number): number {
+  const key = `${pods}|${n}`
+  const hit = dropCache.get(key)
+  if (hit !== undefined) return hit
+  let drop = 0
+  if (pods < podsAtLevel(n, 0) - 1e-6) {
+    let lo = 0
+    let hi = BATH.mountRadius
+    for (let i = 0; i < 50; i++) {
+      const mid = (lo + hi) / 2
+      if (podsAtLevel(n, mid) > pods) lo = mid
+      else hi = mid
+    }
+    // +0,005 mm: si el nivel cae justo sobre el borde de una vaina (p. ej. 7,0), ésta queda seca de verdad
+    // y no "mojada en 1e-17", lo que dejaría una posición casi seca como parada previa al retiro.
+    drop = (lo + hi) / 2 + 0.005
+  }
+  dropCache.set(key, drop)
+  return drop
 }
 
 /** Paso térmico de un caño en el carrusel con fracción sumergida f. */

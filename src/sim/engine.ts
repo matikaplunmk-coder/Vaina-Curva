@@ -15,6 +15,7 @@ import {
   SENSOR_MAX_INJECT,
   SENSOR_STOP_TEMP,
   classifyDemold,
+  levelDropFor,
   submergedFraction,
   TANK_UA,
   tubeInnerVolumeL,
@@ -185,7 +186,7 @@ export class CellSimulation {
 
   constructor(params: SimParams) {
     this.params = params
-    this.stations = carouselStations(params.slots, params.loadStation, params.pickStationK)
+    this.stations = carouselStations(params.slots, params.loadStation, params.pickStationK, levelDropFor(params.bathPods, params.slots))
     this.state = this.initialState()
   }
 
@@ -211,7 +212,7 @@ export class CellSimulation {
 
   private initialState(): SimState {
     this.updateDwell()
-    this.stations = carouselStations(this.params.slots, this.params.loadStation, this.params.pickStationK)
+    this.stations = carouselStations(this.params.slots, this.params.loadStation, this.params.pickStationK, levelDropFor(this.params.bathPods, this.params.slots))
     const p = this.params
     const n = p.slots
     const slots: (Tube | null)[] = new Array(n).fill(null)
@@ -226,7 +227,7 @@ export class CellSimulation {
       const { loadK, journey } = this.stations
       const temps = [p.ambientTemp]
       const tauL = bathTau(p.bathTau, p.wallThickness)
-      for (const pos of trajectoryPositions(n, p.loadStation, p.pickStationK)) {
+      for (const pos of trajectoryPositions(n, p.loadStation, p.pickStationK, levelDropFor(p.bathPods, n))) {
         temps.push(carouselStep(temps[temps.length - 1], pos.f, cycle, p.bathTemp, p.ambientTemp, tauL))
       }
       for (let k = 0; k < n; k++) {
@@ -374,7 +375,7 @@ export class CellSimulation {
     for (let i = 0; i < s.slots.length; i++) {
       const tube = s.slots[i]
       if (!tube) continue
-      const f = submergedFraction(this.slotAngle(i))
+      const f = submergedFraction(this.slotAngle(i), levelDropFor(p.bathPods, s.slots.length))
       qTubes += (m * HDPE.cp * f * (bath.temp - tube.temp)) / tauL
       tube.temp = carouselStep(tube.temp, f, dt, bath.temp, p.ambientTemp, tauL)
       if (tube.temp > HDPE.overheatAlarm && !tube.overheatAlarmed) {

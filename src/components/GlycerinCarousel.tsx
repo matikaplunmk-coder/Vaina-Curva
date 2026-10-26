@@ -1,6 +1,6 @@
 import { interlockThreshold } from '../sim/balance'
 import type { CellSimulation } from '../sim/engine'
-import { BATH, HDPE, PIPE, submergedFraction, tempColor } from '../sim/physics'
+import { BATH, HDPE, levelDropFor, PIPE, submergedFraction, tempColor } from '../sim/physics'
 import { fmt } from './format'
 import { shade } from './render/color'
 
@@ -29,12 +29,18 @@ function arcCCW(fromDeg: number, toDeg: number, r: number) {
   return `M ${x0} ${y0} A ${r} ${r} 0 0 0 ${x1} ${y1}`
 }
 
-function surfacePath(phase: number) {
-  const x0 = CX - R_BATH
-  const w = 2 * R_BATH
-  let d = `M ${x0} ${CY}`
-  for (let x = 0; x <= w; x += 6) d += ` L ${x0 + x} ${CY + Math.sin((x + phase) / 9) * 1.4}`
+function surfacePath(phase: number, level: { y: number; half: number }) {
+  const x0 = CX - level.half
+  const w = 2 * level.half
+  let d = `M ${x0} ${level.y}`
+  for (let x = 0; x <= w; x += 6) d += ` L ${x0 + x} ${level.y + Math.sin((x + phase) / 9) * 1.4}`
   return d
+}
+
+/** Segmento de batea ocupado por la glicerina: el nivel queda `drop` mm bajo el eje (resistencias en el fondo). */
+function bathLevel(drop: number) {
+  const y = CY + drop * SCALE
+  return { y, half: Math.sqrt(R_BATH * R_BATH - (y - CY) * (y - CY)) }
 }
 
 export function GlycerinCarousel({ sim, render = false }: { sim: CellSimulation; render?: boolean }) {
@@ -42,6 +48,9 @@ export function GlycerinCarousel({ sim, render = false }: { sim: CellSimulation;
   const p = sim.params
   const n = s.slots.length
   const bath = s.bath
+  const drop = levelDropFor(p.bathPods, n)
+  const level = bathLevel(drop)
+  const liquidShape = `M ${CX - level.half} ${level.y} A ${R_BATH} ${R_BATH} 0 0 0 ${CX + level.half} ${level.y} Z`
   const st = sim.stations
   const pickTube = sim.pickTube()
   const loadEmpty = s.indexProgress === null && s.slots[sim.loadSlot()] === null
@@ -54,7 +63,7 @@ export function GlycerinCarousel({ sim, render = false }: { sim: CellSimulation;
   let inAir = 0
   const tubes = s.slots.map((tube, i) => {
     const angle = sim.slotAngle(i)
-    const f = submergedFraction(angle)
+    const f = submergedFraction(angle, drop)
     if (tube) {
       if (f > 0.5) submerged++
       else if (f === 0) inAir++
@@ -113,11 +122,11 @@ export function GlycerinCarousel({ sim, render = false }: { sim: CellSimulation;
         convección natural · {inAir} caños
       </text>
 
-      {/* Glicerina (hasta el nivel del eje) */}
-      <path d={`M ${CX - R_BATH} ${CY} A ${R_BATH} ${R_BATH} 0 0 0 ${CX + R_BATH} ${CY} Z`} fill={render ? 'url(#rm-amber)' : 'url(#glycerin)'} />
-      {render && <path d={`M ${CX - R_BATH} ${CY} A ${R_BATH} ${R_BATH} 0 0 0 ${CX + R_BATH} ${CY} Z`} fill="url(#rm-depth)" fillOpacity="0.45" />}
-      <path d={surfacePath(s.t * 8)} fill="none" stroke="#fde68a" strokeOpacity={render ? 0.9 : 0.7} strokeWidth={render ? 1.6 : 1.2} />
-      {render && <path d={surfacePath(s.t * 8 + 40)} fill="none" stroke="#fff" strokeOpacity="0.28" strokeWidth="0.8" transform="translate(0 2.6)" />}
+      {/* Glicerina: el nivel queda por debajo del eje porque las resistencias ocupan el fondo */}
+      <path d={liquidShape} fill={render ? 'url(#rm-amber)' : 'url(#glycerin)'} />
+      {render && <path d={liquidShape} fill="url(#rm-depth)" fillOpacity="0.45" />}
+      <path d={surfacePath(s.t * 8, level)} fill="none" stroke="#fde68a" strokeOpacity={render ? 0.9 : 0.7} strokeWidth={render ? 1.6 : 1.2} />
+      {render && <path d={surfacePath(s.t * 8 + 40, level)} fill="none" stroke="#fff" strokeOpacity="0.28" strokeWidth="0.8" transform="translate(0 2.6)" />}
 
       {/* Batea semicilíndrica */}
       {render && (

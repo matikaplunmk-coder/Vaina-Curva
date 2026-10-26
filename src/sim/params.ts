@@ -57,6 +57,8 @@ export interface SimParams {
   // --- C. Mecánica y geometría ---
   /** Posiciones del carrusel */
   slots: number
+  /** Vainas que entran a la vez en la glicerina (las resistencias del fondo bajan el nivel del eje) */
+  bathPods: number
   /** Estación de RETIRO: 0 = automática (primera posición emergida); k > 0 = forzada a k pasos del cenit */
   pickStationK: number
   /** Dónde carga el operario el caño frío */
@@ -108,6 +110,7 @@ export const DEFAULT_PARAMS: SimParams = {
   wallThickness: 2.5,
 
   slots: 16,
+  bathPods: 7.5,
   pickStationK: 0,
   loadStation: 'top',
   clampPressureBar: 6,
@@ -122,7 +125,7 @@ export const DEFAULT_PARAMS: SimParams = {
 }
 
 /** Parámetros que cambian la configuración física y obligan a reiniciar la simulación. */
-export const RESET_KEYS: (keyof SimParams)[] = ['slots', 'coldStart', 'loadStation', 'pickStationK']
+export const RESET_KEYS: (keyof SimParams)[] = ['slots', 'bathPods', 'coldStart', 'loadStation', 'pickStationK']
 
 type NumericKey = { [K in keyof SimParams]: SimParams[K] extends number ? K : never }[keyof SimParams]
 
@@ -153,6 +156,7 @@ export const PARAM_RANGES: Record<NumericKey, { min: number; max: number; step: 
   wallThickness: { min: 2, max: 3, step: 0.1 },
 
   slots: { min: 10, max: 18, step: 1 },
+  bathPods: { min: 6, max: 8, step: 0.25 },
   pickStationK: { min: 0, max: 8, step: 1 },
   clampPressureBar: { min: 2, max: 8, step: 0.1 },
   clampBoreMm: { min: 20, max: 100, step: 1 },

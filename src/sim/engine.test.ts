@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { carouselStations, computeBalance, interlockThreshold, minCarouselCycle } from './balance'
 import { CellSimulation } from './engine'
 import { DEFAULT_PARAMS, type SimParams } from './params'
-import { HDPE, submergedFraction } from './physics'
+import { HDPE, levelDropFor, submergedFraction } from './physics'
 
 /** Configuración limitada por el carrusel (12 posiciones) para aislar el enclavamiento térmico. */
+const FLUSH: SimParams = { ...DEFAULT_PARAMS, bathPods: 8 } // nivel al ras del eje (caso anterior)
 const CAROUSEL_BOUND: Partial<SimParams> = { slots: 12 }
 
 const run = (over: Partial<SimParams>, seconds: number) => {
@@ -16,22 +17,27 @@ const run = (over: Partial<SimParams>, seconds: number) => {
 describe('balance de línea', () => {
   it('valores nominales: 16 posiciones, glicerina 132 °C, retiro a 120 °C, τ 75 s', () => {
     expect(DEFAULT_PARAMS.slots).toBe(16)
+    expect(DEFAULT_PARAMS.bathPods).toBe(7.5) // las resistencias del fondo dejan entrar 7–8 vainas
     expect(DEFAULT_PARAMS.bathTemp).toBe(132)
     expect(DEFAULT_PARAMS.targetTemp).toBe(120)
     expect(DEFAULT_PARAMS.bathTau).toBe(75)
   })
 
   it('retención mínima por estación para 25 → 120 °C con baño a 132 °C', () => {
-    const b = computeBalance(DEFAULT_PARAMS)
+    const b = computeBalance(FLUSH)
     // 75 s · ln(107/12) ≈ 164 s sumergido, repartidos en 8 posiciones equivalentes
     expect(b.heatTime).toBeGreaterThan(160)
     expect(b.heatTime).toBeLessThan(170)
     expect(b.cycleCarousel).toBeGreaterThan(20)
     expect(b.cycleCarousel).toBeLessThan(21.5)
+    // con 7,5 vainas mojadas el mismo calor se reparte en menos posiciones: más retención por estación
+    const real = computeBalance(DEFAULT_PARAMS)
+    expect(Math.abs(real.heatTime - b.heatTime)).toBeLessThan(3)
+    expect(real.cycleCarousel).toBeGreaterThan(b.cycleCarousel)
   })
 
-  it('con 16 posiciones el carrusel deja de ser el cuello de botella: manda operario + prensa', () => {
-    const b = computeBalance(DEFAULT_PARAMS)
+  it('con el nivel al ras (8 vainas) el carrusel no es el cuello de botella: manda operario + prensa', () => {
+    const b = computeBalance(FLUSH)
     expect(b.cycleCarousel).toBeLessThan(b.cycleOperator)
     expect(b.bottleneck).toBe('prensa')
     expect(b.cycle).toBeCloseTo(b.cycleOperator, 6)
@@ -45,9 +51,39 @@ describe('balance de línea', () => {
   })
 
   it('media vuelta sumergida: 16 → 8, 12 → 6 y 10 → 5 posiciones equivalentes en glicerina', () => {
-    expect(computeBalance(DEFAULT_PARAMS).submergedPositions).toBeCloseTo(8, 5)
-    expect(computeBalance({ ...DEFAULT_PARAMS, slots: 12 }).submergedPositions).toBeCloseTo(6, 5)
-    expect(computeBalance({ ...DEFAULT_PARAMS, slots: 10 }).submergedPositions).toBeCloseTo(5, 5)
+    expect(computeBalance(FLUSH).submergedPositions).toBeCloseTo(8, 5)
+    expect(computeBalance({ ...FLUSH, slots: 12 }).submergedPositions).toBeCloseTo(6, 5)
+    expect(computeBalance({ ...FLUSH, slots: 10 }).submergedPositions).toBeCloseTo(5, 5)
+  })
+
+  it('vainas simultáneas en la glicerina: el nivel baja del eje y cambia la cantidad mojada y el ciclo', () => {
+    const at = (bathPods: number) => computeBalance({ ...DEFAULT_PARAMS, bathPods })
+    expect(at(8).submergedPositions).toBeCloseTo(8, 5)
+    expect(at(7.5).submergedPositions).toBeCloseTo(7.5, 3)
+    expect(at(7).submergedPositions).toBeCloseTo(7, 3)
+    expect(at(6.5).submergedPositions).toBeCloseTo(6.5, 3)
+    expect(levelDropFor(8, 16)).toBeCloseTo(0, 9)
+    expect(levelDropFor(7, 16)).toBeGreaterThan(levelDropFor(7.5, 16))
+    expect(levelDropFor(7.5, 16)).toBeGreaterThan(0)
+    expect(levelDropFor(7.5, 16)).toBeLessThan(20) // 7–8 vainas: el nivel baja menos de un radio de caño
+    // menos vainas en el baño → más retención por estación → ciclo de carrusel mayor
+    expect(at(7).cycleCarousel).toBeGreaterThan(at(7.5).cycleCarousel)
+    expect(at(7.5).cycleCarousel).toBeGreaterThan(at(8).cycleCarousel)
+    // el nivel nunca sube del eje, aunque se pida más
+    expect(levelDropFor(10, 16)).toBe(0)
+  })
+
+  it('con 7–8 vainas el ciclo se sostiene; por debajo de ~7,3 el carrusel pasa a ser el cuello de botella', () => {
+    const at = (bathPods: number) => computeBalance({ ...DEFAULT_PARAMS, bathPods })
+    for (const pods of [7, 7.5, 8]) {
+      const b = at(pods)
+      expect(Number.isFinite(b.cycle)).toBe(true) // incluido 7,0: la vaina del borde queda seca y se retira al emerger
+      expect(b.pickTemp).toBeGreaterThan(119.9)
+    }
+    expect(at(7.5).bottleneck).toBe('prensa')
+    expect(at(7.5).cycle).toBeCloseTo(22.9, 6)
+    expect(at(6.5).bottleneck).toBe('carrusel')
+    expect(at(6.5).cycle).toBeGreaterThan(24)
   })
 
   it('retiro inmediato: sin arco aéreo, el caño se retira a la consigna de conformado', () => {
@@ -135,7 +171,7 @@ describe('estaciones del carrusel', () => {
       sim.stepToNextEvent()
       if (task === 'PICK' && sim.state.operator.carrying) {
         expect(sim.state.operator.carrying).toBe(before)
-        expect(submergedFraction(sim.slotAngle(pickIdx))).toBe(0)
+        expect(submergedFraction(sim.slotAngle(pickIdx), levelDropFor(sim.params.bathPods, 16))).toBe(0)
         picked = true
       }
       if (task === 'LOAD' && sim.state.operator.task !== 'LOAD') {

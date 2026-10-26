@@ -65,6 +65,19 @@ describe('panel de parámetros y calibración', () => {
     expect(text('drawer-cycle')).toBe('22,90 s')
   })
 
+  it('el slider de vainas en la glicerina baja el nivel y recalcula el ciclo del carrusel', () => {
+    render(<App />)
+    openDrawer()
+    fireEvent.click(screen.getByRole('tab', { name: 'C · Mecánica' }))
+    const slider = screen.getByLabelText('Vainas en la glicerina a la vez')
+    expect((slider as HTMLInputElement).value).toBe('7.5')
+    expect(screen.getByText(/bajan el nivel 10 mm por debajo del eje/)).toBeTruthy()
+    fireEvent.change(slider, { target: { value: '6.5' } })
+    expect(text('drawer-cycle')).toBe('25,35 s') // con 6,5 vainas el carrusel manda
+    fireEvent.change(slider, { target: { value: '8' } })
+    expect(text('drawer-cycle')).toBe('22,90 s')
+  })
+
   it('la fuerza de mordaza se recalcula con la presión y el diámetro del cilindro', () => {
     render(<App />)
     openDrawer()

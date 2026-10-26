@@ -13,7 +13,7 @@ import { useSimulation } from './hooks/useSimulation'
 import { useViewMode } from './hooks/viewMode'
 import { computeBalance, trajectoryCurve, trajectoryPositions } from './sim/balance'
 import type { OpTask } from './sim/engine'
-import { bathTau, EMERGED_TAU, HDPE, hydraulics, PIPE } from './sim/physics'
+import { bathTau, EMERGED_TAU, HDPE, hydraulics, levelDropFor, PIPE } from './sim/physics'
 
 const BREAKDOWN: { k: OpTask; c: string }[] = [
   { k: 'UNLOAD', c: '#3987e5' },
@@ -71,7 +71,7 @@ export default function App() {
   const trajectory = useMemo(() => {
     const curve = trajectoryCurve(p, trajCycle)
     const spans: [number, number][] = []
-    trajectoryPositions(p.slots, p.loadStation).forEach((pos, j) => {
+    trajectoryPositions(p.slots, p.loadStation, 0, levelDropFor(p.bathPods, p.slots)).forEach((pos, j) => {
       if (pos.f <= 0) return
       const a = j * trajCycle
       const last = spans[spans.length - 1]

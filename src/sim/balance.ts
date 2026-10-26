@@ -7,6 +7,7 @@ import {
   carouselStep,
   firstOrder,
   AIR_TAU,
+  levelDropFor,
   submergedFraction,
   relax,
   SENSOR_MAX_INJECT,
@@ -90,8 +91,8 @@ export function computeBalance(p: SimParams, waterTemp = p.waterInitTemp): LineB
   const load = p.coldLoadMs / 1000
   const operatorWork = d[10] + load
 
-  const stations = carouselStations(p.slots, p.loadStation, p.pickStationK)
-  const positions = trajectoryPositions(p.slots, p.loadStation, p.pickStationK)
+  const stations = carouselStations(p.slots, p.loadStation, p.pickStationK, levelDropFor(p.bathPods, p.slots))
+  const positions = trajectoryPositions(p.slots, p.loadStation, p.pickStationK, levelDropFor(p.bathPods, p.slots))
   const submergedPositions = positions.reduce((a, x) => a + x.f, 0)
   const bathPositions = positions.filter((x) => x.f > 0).length
 
@@ -219,11 +220,11 @@ export interface CarouselStations {
  *   apenas se descubre del baño, sin arco aéreo).
  * - CARGA FRÍO: el cenit, o la última posición al aire del lado que baja, antes de entrar al baño.
  */
-export function carouselStations(n: number, loadStation: LoadStation, forcedPickK = 0): CarouselStations {
+export function carouselStations(n: number, loadStation: LoadStation, forcedPickK = 0, drop = 0): CarouselStations {
   const step = 360 / n
-  const auto = autoPickK(n)
+  const auto = autoPickK(n, drop)
   const pickK = forcedPickK >= 1 && forcedPickK * step < 180 ? forcedPickK : auto
-  const loadK = loadStation === 'preEntry' ? lastAirBeforeBath(n, step) : 0
+  const loadK = loadStation === 'preEntry' ? lastAirBeforeBath(n, step, drop) : 0
   return {
     n,
     step,
@@ -238,25 +239,25 @@ export function carouselStations(n: number, loadStation: LoadStation, forcedPick
 }
 
 /** Primera posición completamente emergida del lado que sube. */
-export function autoPickK(n: number): number {
+export function autoPickK(n: number, drop = 0): number {
   const step = 360 / n
   let pickK = 1
-  for (let k = 1; k * step < 180; k++) if (submergedFraction(k * step) === 0) pickK = k
+  for (let k = 1; k * step < 180; k++) if (submergedFraction(k * step, drop) === 0) pickK = k
   return pickK
 }
 
 /** Posiciones elegibles para forzar el RETIRO: lado que sube (0° < ángulo < 180°). */
-export function pickChoices(n: number): { k: number; angle: number; f: number }[] {
+export function pickChoices(n: number, drop = 0): { k: number; angle: number; f: number }[] {
   const step = 360 / n
   const out = []
-  for (let k = 1; k * step < 180; k++) out.push({ k, angle: k * step, f: submergedFraction(k * step) })
+  for (let k = 1; k * step < 180; k++) out.push({ k, angle: k * step, f: submergedFraction(k * step, drop) })
   return out
 }
 
 /** Última posición al aire del lado que baja (menor ángulo > 180° sin contacto con el líquido). */
-function lastAirBeforeBath(n: number, step: number): number {
+function lastAirBeforeBath(n: number, step: number, drop: number): number {
   let best = 0
-  for (let k = n - 1; k * step > 180 && submergedFraction(k * step) === 0; k--) best = k
+  for (let k = n - 1; k * step > 180 && submergedFraction(k * step, drop) === 0; k--) best = k
   return best
 }
 
@@ -264,11 +265,11 @@ function lastAirBeforeBath(n: number, step: number): number {
  * Posiciones de permanencia de un caño entre la carga y el retiro: j = 1..J−1 (un ciclo en cada
  * una). La posición J es la estación de retiro, donde se toma al llegar.
  */
-export function trajectoryPositions(n: number, loadStation: LoadStation, forcedPickK = 0): { angle: number; f: number }[] {
-  const st = carouselStations(n, loadStation, forcedPickK)
+export function trajectoryPositions(n: number, loadStation: LoadStation, forcedPickK = 0, drop = 0): { angle: number; f: number }[] {
+  const st = carouselStations(n, loadStation, forcedPickK, drop)
   return Array.from({ length: st.journey - 1 }, (_, i) => {
     const angle = (((st.loadK - (i + 1)) % n) + n) % n * st.step
-    return { angle, f: submergedFraction(angle) }
+    return { angle, f: submergedFraction(angle, drop) }
   })
 }
 
@@ -279,7 +280,7 @@ export function trajectoryPositions(n: number, loadStation: LoadStation, forcedP
 export function arrivalTemps(p: SimParams, cycle: number) {
   const tauL = bathTau(p.bathTau, p.wallThickness)
   let T = p.ambientTemp
-  for (const pos of trajectoryPositions(p.slots, p.loadStation, p.pickStationK)) {
+  for (const pos of trajectoryPositions(p.slots, p.loadStation, p.pickStationK, levelDropFor(p.bathPods, p.slots))) {
     T = carouselStep(T, pos.f, cycle, p.bathTemp, p.ambientTemp, tauL)
   }
   const station = carouselStep(T, 0, CAROUSEL_INDEX_TIME, p.bathTemp, p.ambientTemp, tauL)
@@ -292,7 +293,7 @@ export function trajectoryCurve(p: SimParams, cycle: number, step = 2) {
   let T = p.ambientTemp
   let t = 0
   const pts = [{ t, temp: T, f: 0 }]
-  for (const pos of trajectoryPositions(p.slots, p.loadStation, p.pickStationK)) {
+  for (const pos of trajectoryPositions(p.slots, p.loadStation, p.pickStationK, levelDropFor(p.bathPods, p.slots))) {
     const k = Math.max(1, Math.round(cycle / step))
     for (let i = 0; i < k; i++) {
       T = carouselStep(T, pos.f, cycle / k, p.bathTemp, p.ambientTemp, tauL)
