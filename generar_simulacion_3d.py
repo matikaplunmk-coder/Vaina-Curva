@@ -193,19 +193,49 @@ def clear_scene():
 # ---------------------------------------------------------------- materiales
 
 
-def _set(bsdf, names, value):
+def find_node(nodes, node_type):
+    """Primer nodo de un tipo interno (p. ej. 'BSDF_PRINCIPLED'). Nunca por nombre: éste cambia con el idioma de la interfaz."""
+    return next((n for n in nodes if n.type == node_type), None)
+
+
+def get_principled(mat):
+    """Nodo Principled BSDF del material (lo crea y lo conecta a la salida si no existe)."""
+    if not mat.use_nodes:
+        mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    bsdf = find_node(nodes, "BSDF_PRINCIPLED")
+    if bsdf is None:
+        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+    out = find_node(nodes, "OUTPUT_MATERIAL")
+    if out is None:
+        out = nodes.new(type="ShaderNodeOutputMaterial")
+    if not out.inputs[0].is_linked:  # entrada 0 = Surface
+        mat.node_tree.links.new(bsdf.outputs[0], out.inputs[0])  # salida 0 = BSDF
+    return bsdf
+
+
+def get_input(node, names):
+    """Socket de entrada por nombre o por identificador (tolera variantes entre versiones 4.x). None si no existe."""
     for n in (names,) if isinstance(names, str) else names:
-        if n in bsdf.inputs:
-            bsdf.inputs[n].default_value = value
-            return True
-    return False
+        for sock in node.inputs:
+            if sock.name == n or sock.identifier == n:
+                return sock
+    return None
+
+
+def _set(bsdf, names, value):
+    sock = get_input(bsdf, names)
+    if sock is None:
+        return False
+    sock.default_value = value
+    return True
 
 
 def make_material(name, color=(0.5, 0.5, 0.5), metallic=0.0, roughness=0.5, alpha=1.0, transmission=0.0, ior=None, emission=None, emission_strength=0.0, coat=0.0):
     """Principled BSDF con tolerancia a los cambios de nombres entre versiones 4.x."""
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
-    b = mat.node_tree.nodes["Principled BSDF"]
+    b = get_principled(mat)
     _set(b, "Base Color", (*lin(color), 1.0))
     _set(b, "Metallic", metallic)
     _set(b, "Roughness", roughness)
@@ -408,19 +438,18 @@ def emission_strength(t):
 
 def set_tube_temp(mat, t, frame=None):
     r, g, b = temp_rgb(t)
-    bsdf = mat.node_tree.nodes["Principled BSDF"]
-    sockets = [
-        (bsdf.inputs["Base Color"], (*lin((r, g, b)), 1.0)),
-        (bsdf.inputs["Emission Color" if "Emission Color" in bsdf.inputs else "Emission"], (*lin((r, g, b)), 1.0)),
-    ]
-    for sock, val in sockets:
+    bsdf = get_principled(mat)
+    rgba = (*lin((r, g, b)), 1.0)
+    for sock, val in (
+        (get_input(bsdf, "Base Color"), rgba),
+        (get_input(bsdf, ("Emission Color", "Emission")), rgba),
+        (get_input(bsdf, "Emission Strength"), emission_strength(t)),
+    ):
+        if sock is None:
+            continue
         sock.default_value = val
         if frame is not None:
             sock.keyframe_insert("default_value", frame=frame)
-    st = bsdf.inputs["Emission Strength"]
-    st.default_value = emission_strength(t)
-    if frame is not None:
-        st.keyframe_insert("default_value", frame=frame)
 
 
 # ============================================================================================
@@ -1162,9 +1191,13 @@ def build_scene_setup(scene, root):
     # mundo
     world = bpy.data.worlds.new("Mundo_Planta")
     world.use_nodes = True
-    bg = world.node_tree.nodes["Background"]
-    bg.inputs["Color"].default_value = (*lin((0.07, 0.09, 0.12)), 1.0)
-    bg.inputs["Strength"].default_value = 0.9
+    wnodes = world.node_tree.nodes
+    bg = find_node(wnodes, "BACKGROUND") or wnodes.new(type="ShaderNodeBackground")
+    wout = find_node(wnodes, "OUTPUT_WORLD") or wnodes.new(type="ShaderNodeOutputWorld")
+    if not wout.inputs[0].is_linked:  # entrada 0 = Surface
+        world.node_tree.links.new(bg.outputs[0], wout.inputs[0])
+    bg.inputs[0].default_value = (*lin((0.07, 0.09, 0.12)), 1.0)  # Color
+    bg.inputs[1].default_value = 0.9  # Strength
     scene.world = world
     # luces
     sun = bpy.data.lights.new("Sol_Nave", "SUN")
