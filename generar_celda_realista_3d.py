@@ -9,9 +9,12 @@ Versión "planta real" de la simulación web: se genera TODO por código (sin CA
   · Carrusel de 12 posiciones (30°) con avance AUTOMÁTICO y una pequeña inclinación para que la glicerina
     drene al sacar la vaina. Cada vaina (pared 3,5 mm) permanece 100 s en el baño y sale a ~110 °C: la
     constante de tiempo y el intervalo de indexado se calculan para que eso se cumpla.
-  · Estación de conformado en L, mandril abocardador, tanque de 500 L con electrobomba, cañerías.
-  · Operario animado: saca la vaina del carrusel, la coloca en la matriz, acciona el PLC (cilindros
-    neumáticos y bomba), carga un caño frío en el carrusel, retira la pieza y la deja en un canasto.
+  · MESA con el dispositivo: la vaina se apoya, se sujeta con la mordaza y se abocarda ahí mismo, en horizontal.
+    El agua de enfriamiento entra por el abocardado y sale por un codo en el otro extremo, directo al tanque.
+  · Tanque de 500 L (azul) con electrobomba bajo la mesa, y cañerías.
+  · Operario animado: saca la vaina del carrusel POR DELANTE (axialmente, a través de los platos), la apoya en
+    la mesa, acciona el PLC (cilindros neumáticos y bomba), carga un caño frío en el carrusel también por
+    delante, retira la pieza formada y la deja en un canasto.
   · Cada 10 piezas: pausa de la línea, atado del paquete de 10 y reserva en otro canasto.
   · Cámara con zoom en cada operación, y al final una vista cenital y una perspectiva orbital.
 
@@ -27,7 +30,9 @@ Argumentos (después de `--`):
     --no-save         no guarda
 
 Convenciones: 1 unidad = 1 m (cotas en mm pasadas por `mm()`); Z arriba; piso en z = 0.
-El carrusel está en el origen con su eje a lo largo de Y; la estación en L a la derecha (+X).
+El carrusel está en el origen con su eje a lo largo de Y y su FRENTE hacia −Y (por ahí se carga y descarga).
+La mesa con el dispositivo está a la derecha (+X), a ras con el borde de la batea; el operario trabaja en el pasillo
+frontal (−Y). El caño se apoya sobre la mesa a lo largo de X y se dobla hacia el fondo (+Y).
 """
 import argparse
 import bisect
@@ -38,7 +43,7 @@ from math import cos, exp, pi, radians, sin, sqrt
 
 import bpy
 import bmesh  # noqa: E402  (debe importarse después de bpy)
-from mathutils import Euler, Matrix, Vector
+from mathutils import Euler, Matrix, Quaternion, Vector
 
 # ============================================================================================
 # CONFIG
@@ -82,65 +87,83 @@ PLATE_Y = 380.0
 BEARING_Y = 530.0
 SHAFT_LEN = 1300.0
 
-# --- Estación de conformado en L ---
-STATION_O = Vector((1.95, 0.0, 1.00))  # eje del caño en la matriz (mundo)
+# --- Mesa con el dispositivo de conformado (el caño se apoya y se dobla en horizontal sobre la mesa) ---
+Z_TOP = Z_RIM  # la mesa y el borde de la batea quedan a ras
+TABLE_X = (0.50, 2.85)
+TABLE_Y = (-0.45, 0.70)
+STATION_O = Vector((1.55, 0.0, Z_TOP + 0.095))  # eje del caño sobre la mesa (mundo)
+# Rotación local→mundo de la estación: eje del caño (local Y) → −X, codo (local Z) → +Y (hacia el fondo de la mesa),
+# mitad fija (x local ≥ 0) por debajo y mitad móvil por encima. El operario trabaja desde el frente (−Y).
+ST_R = Matrix(((0.0, -1.0, 0.0), (0.0, 0.0, 1.0), (-1.0, 0.0, 0.0)))
+ST_Q = ST_R.to_quaternion()
 BEND_R = 200.0
 LEG_H = 300.0
 GROOVE_R = 20.5
 DIE_X = 90.0
 DIE_BAND = 60.0
 DIE_OPEN = 0.22  # m, recorrido de apertura de las mitades móviles
-OPEN_DIR = Vector((-0.5, 0.0, -0.866))  # diagonal de apertura (abajo y hacia el operario)
+OPEN_DIR = Vector((-0.866, 0.0, -0.5))  # local: la mitad móvil sube y se aleja hacia el operario
 CUP_D, CUP_H = 90.0, 150.0
 MANDREL_STROKE = 100.0
 CONE_HALF_ANGLE = 10.0
 CONE_TIP_R = 16.0
 CONE_LEN = 65.0
 TANK_LITERS = 500.0
-TANK_R = 0.40
-TANK_XY = (2.80, 0.40)
+TANK_BOX = (0.80, 0.80, 0.78)  # tanque rectangular azul: 0,8 × 0,8 × 0,78 m ≈ 500 L
+TANK_C = (1.50, 0.50)  # centro (x, y) bajo la mesa, parte hacia el fondo
 DEMOLD_TEMP = 50.0
 
-# --- Posiciones del operario (x, y, giro Z) — giro 0 = mira a +X, -π = mira a -X ---
-ST_A = (0.55, 0.0, -pi)  # carrusel (retiro y carga)
-ST_B = (1.45, -0.05, 0.0)  # prensa
-ST_PLC = (1.35, -0.20, -pi / 2)  # tablero PLC
-ST_RACK = (1.00, -1.07, -pi)  # rack de caños fríos
-ST_BASKET_A = (1.00, 0.95, 0.0)  # canasto de piezas
-ST_BENCH = (1.00, 1.75, 0.0)  # mesa de atado
-ST_BASKET_B = (1.00, 2.50, 0.0)  # canasto de paquetes
-WP_RACK = (1.00, -0.45)
-WP_LANE = (1.00, 0.30)
 
-# --- Tiempos de un ciclo (s, relativos al inicio del ciclo) ---
+def l2w(v):
+    """Punto de la estación (coordenadas locales) → mundo."""
+    return STATION_O + ST_R @ Vector(v)
+
+
+# --- Posiciones del operario (x, y, giro Z): giro π/2 mira a +Y (hacia las máquinas), −π/2 mira a −Y ---
+ST_P0 = (0.27, -0.95, pi / 2)  # frente al carrusel, posición de retiro (alcanza el extremo delantero de la vaina)
+ST_P1 = (0.27, -1.40, pi / 2)  # tras tirar de la vaina hacia afuera
+ST_T = (1.55, -0.62, pi / 2)  # frente a la mesa
+ST_C = (0.62, -1.15, pi / 2)  # frente al tablero PLC
+ST_RACK = (-0.90, -0.85, pi / 2)  # rack de caños fríos
+ST_L0 = (0.0, -1.40, pi / 2)  # carga: arranca atrás
+ST_L1 = (0.0, -0.95, pi / 2)  # carga: tras empujar el caño hacia adentro
+ST_B = (2.15, -0.70, -pi / 2)  # canasto de piezas
+ST_BENCH = (2.85, -1.00, 0.0)  # mesa de atado
+ST_BB = (2.85, -1.90, 0.0)  # canasto de paquetes
+
+# --- Tiempos de un ciclo (s, relativos al inicio del ciclo = indexado automático del carrusel) ---
 CYCLE_S = 25.0
 REL = dict(
-    index=(0.0, 1.5),  # indexado automático del carrusel
-    reach=(1.5, 2.3),
-    swap=2.3,  # la vaina sale del carrusel
-    pick_end=3.5,
-    carry_end=5.7,  # llegó a la prensa
-    place_end=7.2,
-    press=(7.3, 8.0),  # el operario toca START
-    start=8.0,
-    die_close=(8.0, 9.6),
-    clamp=(9.6, 10.0),
-    mandrel=(10.0, 11.3),
-    water=(11.3, 18.3),
-    purge=(18.3, 19.3),
-    mback=(19.3, 20.1),
-    copen=(20.1, 20.4),
-    dopen=(20.4, 21.9),
-    cup_up=(20.4, 21.4),
-    cup_down=(22.8, 23.6),
-    rack=(9.7, 10.7),
-    carry_cold=(10.7, 12.7),
-    load=(12.7, 14.0),
-    extract=(22.0, 22.8),
-    to_basket=(22.8, 24.2),
-    drop=(24.2, 25.0),
+    index=(0.0, 1.5),
+    reach=(1.9, 2.7),
+    swap=2.7,  # la vaina empieza a salir por delante
+    pull=(2.7, 3.7),
+    carry=(3.7, 5.9),
+    place=(5.9, 6.9),  # se apoya en la mesa, sobre la matriz
+    to_plc=(7.3, 8.1),
+    press=(8.1, 8.4),
+    start=8.4,  # START del PLC
+    die_close=(8.4, 10.0),
+    clamp=(10.0, 10.4),
+    mandrel=(10.4, 11.7),
+    water=(11.7, 18.7),
+    purge=(18.7, 19.7),
+    mback=(19.7, 20.5),
+    copen=(20.5, 20.8),
+    dopen=(20.8, 22.3),
+    elbow_out=(20.8, 21.8),
+    elbow_in=(23.2, 24.0),
+    to_rack=(8.4, 9.9),
+    take=(9.9, 10.9),
+    to_load=(10.9, 12.0),
+    load=(12.0, 13.6),
+    to_table=(13.6, 15.4),
+    lift=(22.4, 22.7),
+    pull_piece=(22.7, 23.1),
+    to_basket=(23.1, 24.0),
+    drop=(24.0, 24.8),
 )
-PACK = dict(grab=1.0, carry=2.0, place=0.8, tie=3.7, lift=0.8, carry2=1.6, place2=1.0, walk=3.0)
+PACK = dict(grab=1.0, carry=1.6, place=0.8, tie=3.7, lift=0.8, carry2=1.6, place2=1.0, walk=3.6)
 
 # Escala de color del simulador 2D (tempColor)
 COLOR_STOPS = [
@@ -468,11 +491,13 @@ def make_text(name, text, col, mat, size=0.05):
     return ob
 
 
-def key_obj(ob, f, pos, euler):
+def key_obj(ob, f, pos, quat):
+    """Pose (posición + cuaternión) keyframeada: los cuaterniones evitan los bloqueos de cardán de las poses planas."""
+    ob.rotation_mode = "QUATERNION"
     ob.location = pos
-    ob.rotation_euler = euler
+    ob.rotation_quaternion = quat
     ob.keyframe_insert("location", frame=f)
-    ob.keyframe_insert("rotation_euler", frame=f)
+    ob.keyframe_insert("rotation_quaternion", frame=f)
 
 
 def key_loc(ob, f, loc):
@@ -788,23 +813,26 @@ def sweep_band(name, s0, s1, x_sign, mat, col):
     return finish(name, bm, mat, col)
 
 
-def build_actuator(name, anchor, u, rod_len, t0, t1, mats, col, post_y, floor_z, parent):
-    """Cilindro neumático diagonal: vástago solidario a la mitad móvil (se anima) y cuerpo fijo a un poste."""
+def build_actuator(name, anchor, u, rod_len, t0, t1, mats, col, post_y, st):
+    """Cilindro neumático diagonal. El vástago (hijo de la estación) se anima con la mitad móvil; cuerpo, brazo y poste quedan fijos sobre la mesa."""
     bm = bmesh.new()
     add_cyl(bm, mm(12), rod_len, anchor + u * (rod_len / 2), u, 24)
-    add_box(bm, (mm(60), mm(20), mm(60)), anchor + u * 0.01)
+    add_box(bm, (mm(60), mm(60), mm(60)), anchor + u * 0.01)
     rod = finish(f"Vastago_{name}", bm, mats["chrome"], col)
+    use_parent(None)
+    pw = l2w(anchor + u * ((t0 + t1) / 2))
+    uw = ST_R @ u
     bm = bmesh.new()
-    add_cyl(bm, mm(36), t1 - t0, anchor + u * ((t0 + t1) / 2), u, 32)
+    add_cyl(bm, mm(36), t1 - t0, pw, uw, 32)
     for t in (t0, t1):
-        add_cyl(bm, mm(42), mm(24), anchor + u * t, u, 32)
+        add_cyl(bm, mm(42), mm(24), l2w(anchor + u * t), uw, 32)
     finish(f"Cilindro_{name}", bm, mats["cyl"], col)
-    p = anchor + u * ((t0 + t1) / 2)
     bm = bmesh.new()
-    add_box(bm, (mm(50), abs(post_y - p.y) + mm(50), mm(50)), (p.x, (post_y + p.y) / 2, p.z))
-    add_box(bm, (mm(60), mm(60), p.z - floor_z), (p.x, post_y, (p.z + floor_z) / 2))
-    add_box(bm, (mm(240), mm(240), mm(16)), (p.x, post_y, floor_z + mm(8)))
+    add_box(bm, (mm(50), abs(post_y - pw.y) + mm(50), mm(50)), (pw.x, (post_y + pw.y) / 2, pw.z))  # brazo a lo largo de Y
+    add_box(bm, (mm(60), mm(60), pw.z - Z_TOP), (pw.x, post_y, (pw.z + Z_TOP) / 2))  # poste sobre la mesa
+    add_box(bm, (mm(240), mm(240), mm(16)), (pw.x, post_y, Z_TOP + mm(8)))
     finish(f"Soporte_{name}", bm, mats["frame"], col, smooth=False, bevel=mm(2))
+    use_parent(st)
     return rod
 
 
@@ -812,8 +840,9 @@ def build_station(root):
     col = new_collection("02_Estacion_L", root)
     O = STATION_O
     st = make_empty("Estacion_L", col, tuple(O), kind="ARROWS", size=0.15)
+    st.rotation_mode = "QUATERNION"
+    st.rotation_quaternion = ST_Q
     use_parent(st)
-    fl = -O.z  # piso en coordenadas locales
     mats = {
         "die": make_material("Matriz_Acero_Mecanizado", (0.5, 0.53, 0.58), metallic=1.0, roughness=0.28),
         "die_move": make_material("Matriz_Movil", (0.42, 0.46, 0.52), metallic=1.0, roughness=0.3),
@@ -822,7 +851,7 @@ def build_station(root):
         "cone": make_material("Cono_Expansor", (0.9, 0.92, 0.95), metallic=1.0, roughness=0.08),
         "cyl": make_material("Cilindro_Neumatico", (0.12, 0.13, 0.16), metallic=0.8, roughness=0.38),
         "frame": make_material("Bastidor_Estacion", (0.08, 0.2, 0.42), metallic=0.3, roughness=0.45),
-        "glass": make_material("Vaso_Acrilico", (0.85, 0.92, 1.0), roughness=0.05, alpha=0.25, transmission=1.0, ior=1.49),
+        "glass": make_material("Vidrio_Acrilico", (0.85, 0.92, 1.0), roughness=0.05, alpha=0.25, transmission=1.0, ior=1.49),
         "water": make_material("Agua_Templado", (0.1, 0.45, 0.95), roughness=0.02, alpha=0.6, transmission=1.0, ior=1.33),
         "blue": make_material("Anodizado_Azul", (0.1, 0.35, 0.8), metallic=0.8, roughness=0.3),
         "pipe": make_material("Caneria_Inox", (0.78, 0.8, 0.84), metallic=1.0, roughness=0.25),
@@ -830,83 +859,47 @@ def build_station(root):
     }
     out = {"root": st, "col": col, "mats": mats}
 
-    # --- Matriz fija en escuadra (x ≥ 0) y matriz móvil curva complementaria (x ≤ 0) ---
+    # --- Matriz fija en escuadra (abajo, apoyada en la mesa) y matriz móvil curva complementaria (arriba) ---
     out["fixed"] = sweep_band("Matriz_Fija_L_R200", mm(200), mm(720), +1, mats["die"], col)
     out["moving"] = sweep_band("Matriz_Movil_Curva", mm(200), mm(700), -1, mats["die_move"], col)
-    # --- Mordaza de sujeción en la entrada recta (mitad fija + mitad móvil, con insertos de bronce) ---
+    # --- Mordaza de sujeción en la entrada recta (mitad fija + mitad móvil con insertos de bronce) ---
     sweep_band("Mordaza_Fija", mm(30), mm(180), +1, mats["brass"], col)
     out["clamp"] = sweep_band("Mordaza_Movil", mm(30), mm(180), -1, mats["brass"], col)
 
     u = OPEN_DIR.normalized()
     ay, az = TUBE_Y0 + LEG + BR * sin(pi / 4), BR * (1 - cos(pi / 4))
-    out["die_rod"] = build_actuator("Matriz_Diagonal", Vector((-mm(DIE_X), ay, az)), u, 0.32, 0.30, 0.60, mats, col, +0.52, fl, st)
     cy_clamp = TUBE_Y0 + mm(105)
-    out["clamp_rod"] = build_actuator("Mordaza_Diagonal", Vector((-mm(DIE_X), cy_clamp, 0.0)), u, 0.30, 0.28, 0.54, mats, col, -0.52, fl, st)
+    out["die_rod"] = build_actuator("Matriz_Diagonal", Vector((-mm(DIE_X), ay, az)), u, 0.32, 0.30, 0.60, mats, col, 0.66, st)
+    out["clamp_rod"] = build_actuator("Mordaza_Diagonal", Vector((-mm(DIE_X), cy_clamp, 0.0)), u, 0.30, 0.28, 0.54, mats, col, 0.66, st)
     out["open_vec"] = u * DIE_OPEN
     out["u"] = u
+    out["anchors"] = {"die": Vector((-mm(DIE_X), ay, az)), "clamp": Vector((-mm(DIE_X), cy_clamp, 0.0))}
 
-    # --- Bancada detrás de las mitades fijas ---
+    # --- Codo de desagote: se acopla al extremo final del caño y lleva el agua directo al tanque ---
+    cy_e, cz_e = TUBE_Y0 + LEG + BR, mm(446)  # extremo del tramo recto final (local)
+    elbow = make_empty("Codo_Grupo", col, (0, 0, 0), size=0.05, parent=st)
+    use_parent(elbow)
+    ze = cz_e + mm(50)
     bm = bmesh.new()
-    wall_top = mm(360)
-    add_box(bm, (mm(20), mm(780), wall_top - fl), (mm(DIE_X) + mm(10), mm(-120), (wall_top + fl) / 2))
-    add_box(bm, (mm(300), mm(1500), mm(20)), (mm(80), mm(-380), fl + mm(10)))
-    for y in (-0.60, -0.15, 0.20):
-        add_box(bm, (mm(140), mm(16), wall_top - fl - mm(60)), (mm(DIE_X) - mm(50), y, (wall_top + fl) / 2 - mm(30)))
-    finish("Bancada_Estacion", bm, mats["frame"], col, smooth=False, bevel=mm(2))
-
-    # --- Vaso superior de rebalse Ø90 × 150: sube un poco para liberar la pieza ---
-    cy = TUBE_Y0 + LEG + BR  # y del tramo vertical
-    cz0 = mm(395)
-    cup_grp = make_empty("Vaso_Grupo", col, (0, 0, 0), size=0.05, parent=st)
-    use_parent(cup_grp)
-    n = 48
-    ro, ri_ = mm(CUP_D / 2), mm(CUP_D / 2 - 3)
-    walls = bmesh.new()
-    rings = []
-    for z in (cz0, cz0 + mm(CUP_H)):
-        rings.append(
-            (
-                [walls.verts.new((ri_ * cos(2 * pi * i / n), cy + ri_ * sin(2 * pi * i / n), z)) for i in range(n)],
-                [walls.verts.new((ro * cos(2 * pi * i / n), cy + ro * sin(2 * pi * i / n), z)) for i in range(n)],
-            )
-        )
-    (ia, oa), (ib, ob_) = rings
-    for i in range(n):
-        j = (i + 1) % n
-        walls.faces.new((oa[i], oa[j], ob_[j], ob_[i]))
-        walls.faces.new((ia[j], ia[i], ib[i], ib[j]))
-        walls.faces.new((ib[i], ib[j], ob_[j], ob_[i]))
-        walls.faces.new((ia[i], ia[j], oa[j], oa[i]))
-    finish("Vaso_Rebalse_D90", walls, mats["glass"], col, edge_split=False)
-    sy_ = cy + mm(85)  # salida lateral fuera de la banda de la matriz
+    add_cyl(bm, mm(27), mm(60), (0, cy_e, cz_e + mm(20)), (0, 0, 1), 32)  # manguito sobre el extremo del caño
+    add_sphere(bm, mm(29), (0, cy_e, ze), 20, 12)  # codo
+    finish("Codo_de_Desagote", bm, mats["pipe"], col)
     bm = bmesh.new()
-    add_cyl(bm, ro, mm(6), (0, cy, cz0 + mm(3)), (0, 0, 1), 48)
-    add_cyl(bm, mm(12), sy_ - cy, (0, (cy + sy_) / 2, cz0 - mm(20)), (0, 1, 0), 24)  # codo lateral
-    add_cyl(bm, mm(12), mm(180), (0, sy_, cz0 - mm(110)), (0, 0, 1), 24)  # niple que baja
-    finish("Vaso_Fondo_y_Niple", bm, mats["pipe"], col)
-    water_h = mm(100)
+    add_cyl(bm, mm(22), mm(120), (mm(60), cy_e, ze), (1, 0, 0), 24)  # bajada (local +X = hacia abajo)
+    finish("Bajada_Codo", bm, mats["glass"], col, edge_split=False)
     bm = bmesh.new()
-    add_cyl(bm, ri_ - mm(1), water_h, (0, 0, water_h / 2), (0, 0, 1), 48)  # origen en la base
-    water = finish("Agua_Vaso", bm, mats["water"], col, edge_split=False)
-    water.location = (0, cy, cz0 + mm(6))
-    out["water"] = water
-    out["cup"] = cup_grp
+    add_cyl(bm, mm(18.5), mm(120), (mm(60), cy_e, ze), (1, 0, 0), 24)
+    out["water"] = finish("Agua_Codo", bm, mats["water"], col, edge_split=False)
+    out["elbow"] = elbow
     use_parent(st)
-    bm = bmesh.new()  # tubo fijo (recibe el niple) y su escuadra a la bancada
-    add_cyl(bm, mm(17), mm(180), (0, sy_, cz0 - mm(150)), (0, 0, 1), 24)
-    add_box(bm, (mm(110), mm(14), mm(14)), (mm(55), sy_, cz0 - mm(110)))
-    finish("Tubo_Fijo_Drenaje", bm, mats["pipe"], col)
-    out["drain_bottom"] = Vector((0, sy_, cz0 - mm(240)))
 
-    # --- Mandril abocardador: cilindro de avance, vástago, cono de 10° y tobera interior ---
+    # --- Mandril abocardador: cilindro de avance, vástago, cono de 10° y tobera interior (entra por el extremo de la campana) ---
     bm = bmesh.new()
     add_cyl(bm, mm(48), mm(240), (0, -mm(1000), 0), (0, 1, 0), 48)
     add_cyl(bm, mm(55), mm(26), (0, -mm(1115), 0), (0, 1, 0), 48)
     add_cyl(bm, mm(55), mm(26), (0, -mm(887), 0), (0, 1, 0), 48)
     for sy in (-1, 1):
         add_cyl(bm, mm(10), mm(300), (sy * mm(60), -mm(1000), mm(60)), (0, 1, 0), 16)
-    add_box(bm, (mm(90), mm(240), -fl - mm(60)), (0, -mm(1000), (fl - mm(60)) / 2 - mm(30)))
-    add_box(bm, (mm(180), mm(300), mm(20)), (0, -mm(1000), fl + mm(10)))
     finish("Cilindro_Mandril", bm, mats["cyl"], col, bevel=mm(1))
     grp = make_empty("Mandril_Grupo", col, (0, 0, 0), size=0.05, parent=st)
     use_parent(grp)
@@ -928,10 +921,22 @@ def build_station(root):
     use_parent(st)
     bm = bmesh.new()
     add_torus(bm, mm(26), mm(10), (0, TUBE_Y0 - mm(170), 0), (0, 1, 0), 32, 10)
-    add_box(bm, (mm(30), mm(30), -fl - mm(40)), (0, TUBE_Y0 - mm(170), (fl - mm(40)) / 2 - mm(20)))
     finish("Guia_Vastago", bm, mats["pipe"], col, bevel=mm(1))
+    use_parent(None)  # soportes del mandril sobre la mesa (mundo)
+    pc = l2w((0.0, -mm(1000), 0.0))
+    bm = bmesh.new()
+    add_box(bm, (mm(240), mm(130), pc.z - mm(48) - Z_TOP), (pc.x, pc.y, (pc.z - mm(48) + Z_TOP) / 2))
+    add_box(bm, (mm(300), mm(200), mm(14)), (pc.x, pc.y, Z_TOP + mm(7)))
+    finish("Soporte_Cilindro_Mandril", bm, mats["frame"], col, smooth=False, bevel=mm(2))
+    pg = l2w((0.0, TUBE_Y0 - mm(170), 0.0))
+    bm = bmesh.new()
+    add_box(bm, (mm(30), mm(60), pg.z - mm(40) - Z_TOP), (pg.x, pg.y, (pg.z - mm(40) + Z_TOP) / 2))
+    add_box(bm, (mm(90), mm(120), mm(12)), (pg.x, pg.y, Z_TOP + mm(6)))
+    finish("Soporte_Guia", bm, mats["frame"], col, smooth=False)
+    use_parent(None)
     out["mandrel"] = grp
     out["mandrel_inlet"] = Vector((0, -mm(1128), 0))
+    out["stub_world"] = l2w((0.0, cy_e, ze))  # eje de la bajada del codo (mundo, a la altura del codo)
 
     # --- Perfil circular Ø40 para el bisel de la curva del caño ---
     prof = bpy.data.curves.new("Perfil_Caño_D40", "CURVE")
@@ -956,7 +961,6 @@ def build_station(root):
     except (RuntimeError, AttributeError):
         pass
     out["profile"] = pob
-    use_parent(None)
     return out
 
 
@@ -993,6 +997,7 @@ def make_tube_curve(station, name, mat):
         bp.handle_left_type = bp.handle_right_type = "FREE"
     cu.materials.append(mat)
     ob = bpy.data.objects.new(name, cu)
+    ob.rotation_mode = "QUATERNION"
     station["col"].objects.link(ob)
     return ob, sp, ss
 
@@ -1036,71 +1041,58 @@ def key_tube(sp, f, with_radius=True):
 
 
 def build_tank_pump_pipes(root, station):
+    """Tanque azul de 500 L bajo la mesa (recibe el agua del codo), electrobomba al lado y cañería hasta el mandril."""
     col = new_collection("03_Tanque_Bomba_Canerias", root)
     use_parent(None)
-    O = STATION_O
     m = station["mats"]
-    steel = make_material("Acero_Tanque", (0.72, 0.74, 0.78), metallic=1.0, roughness=0.32)
-    paint = make_material("Pintura_Bomba", (0.05, 0.28, 0.55), metallic=0.4, roughness=0.4)
+    blue = make_material("Tanque_Azul", (0.05, 0.2, 0.75), metallic=0.3, roughness=0.45)
+    paint = make_material("Pintura_Bomba", (0.55, 0.57, 0.6), metallic=0.8, roughness=0.35)
     cast = make_material("Fundicion_Bomba", (0.2, 0.22, 0.25), metallic=0.9, roughness=0.5)
-    height = (TANK_LITERS / 1000.0) / (pi * TANK_R**2)
-    tx, ty = TANK_XY
-    base = 0.10
+    tx, ty = TANK_C
+    sx, sy, sz = TANK_BOX
     bm = bmesh.new()
-    add_cyl(bm, TANK_R, height, (tx, ty, base + height / 2), (0, 0, 1), 96)
-    add_torus(bm, TANK_R, mm(14), (tx, ty, base + height), (0, 0, 1), 96, 12)
-    add_torus(bm, TANK_R, mm(14), (tx, ty, base), (0, 0, 1), 96, 12)
-    for k in range(3):
-        add_torus(bm, TANK_R, mm(8), (tx, ty, base + height * (k + 1) / 4), (0, 0, 1), 96, 8)
-    add_cyl(bm, mm(110), mm(40), (tx - 0.12, ty - 0.12, base + height + mm(20)), (0, 0, 1), 40)
-    finish("Tanque_500L", bm, steel, col)
+    add_box(bm, (sx, sy, sz), (tx, ty, sz / 2))
+    add_box(bm, (sx + 0.03, sy + 0.03, 0.03), (tx, ty, sz + 0.015))  # tapa
+    for z in (sz * 0.33, sz * 0.66):  # cordones de refuerzo
+        add_box(bm, (sx + 0.012, sy + 0.012, 0.025), (tx, ty, z))
+    finish("Tanque_500L_Azul", bm, blue, col, smooth=False, bevel=mm(4))
+    fw = station["stub_world"]
     bm = bmesh.new()
-    for k in range(4):
-        a = radians(45 + 90 * k)
-        add_box(bm, (mm(70), mm(70), base), (tx + (TANK_R - 0.07) * cos(a), ty + (TANK_R - 0.07) * sin(a), base / 2))
-    finish("Patas_Tanque", bm, m["frame"], col, smooth=False, bevel=mm(2))
-    top_z = base + height
+    add_cyl(bm, mm(25), mm(40), (fw.x, fw.y, sz + 0.03 + 0.02), (0, 0, 1), 32, r2=mm(60))  # embudo bajo la bajada del codo
+    finish("Embudo_Tanque", bm, m["pipe"], col)
 
-    # --- electrobomba centrífuga en la base del tanque (lado −Y) ---
-    py = ty - TANK_R - 0.26
-    pz = mm(110)
+    # --- electrobomba centrífuga bajo la mesa, a la derecha del tanque ---
+    px, py, pz = 2.24, ty - 0.10, 0.14
     bm = bmesh.new()
-    add_cyl(bm, mm(88), mm(250), (tx, py - 0.13, pz), (0, 1, 0), 48)
+    add_cyl(bm, mm(88), mm(280), (px + 0.18, py, pz), (1, 0, 0), 48)  # motor
     for k in range(10):
-        add_cyl(bm, mm(94), mm(5), (tx, py - 0.22 + k * 0.025, pz), (0, 1, 0), 48)
-    add_box(bm, (mm(90), mm(100), mm(70)), (tx, py - 0.1, pz + mm(120)))
-    add_cyl(bm, mm(80), mm(30), (tx, py - 0.275, pz), (0, 1, 0), 40)
+        add_cyl(bm, mm(94), mm(5), (px + 0.07 + k * 0.025, py, pz), (1, 0, 0), 48)
+    add_box(bm, (mm(100), mm(90), mm(70)), (px + 0.18, py, pz + mm(120)))  # caja de bornes
     finish("Electrobomba_Motor", bm, paint, col, bevel=mm(1))
     bm = bmesh.new()
-    add_cyl(bm, mm(105), mm(80), (tx, py + 0.04, pz), (0, 1, 0), 48)
-    add_cyl(bm, mm(26), mm(110), (tx, py + 0.14, pz), (0, 1, 0), 32)
-    add_cyl(bm, mm(22), mm(120), (tx, py + 0.04, pz + mm(150)), (0, 0, 1), 32)
-    add_cyl(bm, mm(36), mm(14), (tx, py + 0.20, pz), (0, 1, 0), 32)
-    add_cyl(bm, mm(32), mm(14), (tx, py + 0.04, pz + mm(212)), (0, 0, 1), 32)
-    add_box(bm, (mm(220), mm(520), mm(20)), (tx, py - 0.1, mm(10)))
+    add_cyl(bm, mm(105), mm(80), (px + 0.02, py, pz), (1, 0, 0), 48)  # voluta
+    add_cyl(bm, mm(26), mm(110), (px - 0.07, py, pz), (1, 0, 0), 32)  # boca de aspiración
+    add_cyl(bm, mm(22), mm(120), (px + 0.02, py, pz + mm(165)), (0, 0, 1), 32)  # descarga
+    add_cyl(bm, mm(36), mm(14), (px - 0.12, py, pz), (1, 0, 0), 32)
+    add_box(bm, (mm(520), mm(220), mm(20)), (px + 0.16, py, mm(10)))  # base
     finish("Electrobomba_Voluta", bm, cast, col, bevel=mm(1))
-    # ventilador/acople visible que gira mientras la bomba trabaja
-    bm = bmesh.new()
-    add_cyl(bm, mm(30), mm(20), (0, 0, 0), (0, 1, 0), 24)
+    bm = bmesh.new()  # ventilador/acople que gira mientras la bomba trabaja
+    add_cyl(bm, mm(30), mm(20), (0, 0, 0), (1, 0, 0), 24)
     for k in range(6):
         a = k * pi / 3
-        mtx = Matrix.Translation((mm(55) * cos(a), 0, mm(55) * sin(a))) @ Matrix.Rotation(-a, 4, "Y")
-        bmesh.ops.create_cube(bm, size=1.0, matrix=mtx @ Matrix.Diagonal((mm(60), mm(6), mm(18), 1.0)))
+        mtx = Matrix.Translation((0, mm(55) * cos(a), mm(55) * sin(a))) @ Matrix.Rotation(a, 4, "X")
+        bmesh.ops.create_cube(bm, size=1.0, matrix=mtx @ Matrix.Diagonal((mm(6), mm(60), mm(18), 1.0)))
     fan = finish("Ventilador_Bomba", bm, m["blue"], col, smooth=False)
-    fan.location = (tx, py - 0.31, pz)
-    inlet = Vector((tx, py + 0.20, pz))
-    outlet = Vector((tx, py + 0.04, pz + mm(220)))
+    fan.location = (px + 0.34, py, pz)
 
-    # --- cañerías: aspiración, impulsión al mandril y retorno del rebalse ---
-    tank_out = Vector((tx, ty - TANK_R, pz))
-    make_pipe("Caneria_Aspiracion", [tank_out, inlet], mm(23), m["pipe"], col, fillet=0.04)
-    inlet_m = O + station["mandrel_inlet"]
-    route = [outlet, Vector((tx, outlet.y, 0.45)), Vector((tx, inlet_m.y - 0.14, 0.45)), Vector((inlet_m.x, inlet_m.y - 0.14, 0.45)), Vector((inlet_m.x, inlet_m.y - 0.14, inlet_m.z)), inlet_m]
+    # --- cañerías: aspiración (tanque → bomba) e impulsión (bomba → mandril, por el abocardado) ---
+    tank_out = Vector((tx + sx / 2, py, pz))
+    make_pipe("Caneria_Aspiracion", [tank_out, Vector((px - 0.12, py, pz))], mm(23), m["pipe"], col, fillet=0.04)
+    inlet_m = l2w(station["mandrel_inlet"])
+    outlet = Vector((px + 0.02, py, pz + mm(225)))
+    route = [outlet, Vector((px + 0.02, py, 0.62)), Vector((2.95, py, 0.62)), Vector((2.95, inlet_m.y, 0.62)), Vector((2.95, inlet_m.y, inlet_m.z)), inlet_m]
     make_pipe("Caneria_Impulsion_Mandril", route, mm(16), m["pipe"], col, fillet=0.07)
-    d0 = O + station["drain_bottom"]
-    hose = [d0, d0 + Vector((0, 0, -0.04)), Vector((d0.x, 0.52, d0.z - 0.04)), Vector((tx, 0.52, d0.z - 0.04)), Vector((tx, 0.52, top_z + 0.04)), Vector((tx, ty, top_z + 0.04)), Vector((tx, ty, top_z - 0.12))]
-    make_pipe("Manguera_Rebalse", hose, mm(13), m["hose"], col, fillet=0.08)
-    return {"col": col, "fan": fan}
+    return {"col": col, "fan": fan, "fan_pos": Vector(fan.location)}
 
 
 def build_plc(root, station):
@@ -1108,12 +1100,13 @@ def build_plc(root, station):
     col = new_collection("06_PLC", root)
     use_parent(None)
     cab_mat = make_material("Tablero_Gris", (0.55, 0.57, 0.6), metallic=0.4, roughness=0.5)
-    cx, cy_front = 1.35, -0.52
+    cx, cy = 0.60, -0.65
+    front = cy - 0.13  # cara frontal (mira al pasillo, −Y)
     cz = 1.25
     bm = bmesh.new()
-    add_box(bm, (0.30, 0.26, 0.50), (cx, cy_front - 0.13, cz))
-    add_box(bm, (0.20, 0.20, cz - 0.25), (cx, cy_front - 0.13, (cz - 0.25) / 2))
-    add_box(bm, (0.30, 0.20, 0.08), (cx, cy_front - 0.13, cz + 0.29))  # isla de válvulas
+    add_box(bm, (0.30, 0.26, 0.50), (cx, cy, cz))
+    add_box(bm, (0.20, 0.20, cz - 0.25), (cx, cy, (cz - 0.25) / 2))
+    add_box(bm, (0.30, 0.20, 0.08), (cx, cy, cz + 0.29))  # isla de válvulas
     finish("Tablero_PLC", bm, cab_mat, col, smooth=False, bevel=mm(3))
     lights = {}
     spec = [("AUTO", (0.1, 0.9, 0.2)), ("Y1_MATRIZ", (1.0, 0.7, 0.1)), ("Y2_MORDAZA", (1.0, 0.7, 0.1)), ("Y3_MANDRIL", (1.0, 0.7, 0.1)), ("Y4_PURGA", (0.3, 0.7, 1.0)), ("K1_BOMBA", (0.3, 0.7, 1.0))]
@@ -1122,39 +1115,39 @@ def build_plc(root, station):
         bm = bmesh.new()
         x = cx - 0.105 + (i % 3) * 0.105
         z = cz + 0.15 - (i // 3) * 0.07
-        add_cyl(bm, mm(14), mm(10), (x, cy_front + 0.003, z), (0, 1, 0), 24)
+        add_cyl(bm, mm(14), mm(10), (x, front - 0.003, z), (0, 1, 0), 24)
         finish(f"Luz_{nm}", bm, mat, col)
         lights[nm] = mat
     bm = bmesh.new()
     add_cyl(bm, mm(20), mm(14), (0, 0, 0), (0, 1, 0), 24)
     start_mat = make_material("Boton_START", (0.1, 0.7, 0.2), roughness=0.4, emission=(0.1, 0.9, 0.2), emission_strength=0.6)
     btn = finish("Boton_START", bm, start_mat, col)
-    btn.location = (cx - 0.07, cy_front + 0.003, cz - 0.04)
+    btn.location = (cx - 0.07, front - 0.003, cz - 0.04)
     bm = bmesh.new()
-    add_cyl(bm, mm(20), mm(14), (cx + 0.02, cy_front + 0.003, cz - 0.04), (0, 1, 0), 24)
-    add_cyl(bm, mm(26), mm(18), (cx + 0.09, cy_front + 0.003, cz - 0.04), (0, 1, 0), 24)
+    add_cyl(bm, mm(20), mm(14), (cx + 0.02, front - 0.003, cz - 0.04), (0, 1, 0), 24)
+    add_cyl(bm, mm(26), mm(18), (cx + 0.09, front - 0.003, cz - 0.04), (0, 1, 0), 24)
     finish("Botones_STOP_y_Emergencia", bm, make_material("Rojo_Pulsador", (0.8, 0.05, 0.05), roughness=0.4), col)
     # mangueras de aire de la isla de válvulas a los tres cilindros neumáticos
     air = make_material("Manguera_Aire", (0.1, 0.35, 0.9), roughness=0.5)
-    O = STATION_O
     u = station["u"]
-    die_rear = O + Vector((-mm(DIE_X), TUBE_Y0 + LEG + BR * sin(pi / 4), BR * (1 - cos(pi / 4)))) + u * 0.60
-    clamp_rear = O + Vector((-mm(DIE_X), TUBE_Y0 + mm(105), 0.0)) + u * 0.54
-    mand = O + Vector((0, -mm(1000), mm(55)))
-    top = Vector((cx, cy_front - 0.13, cz + 0.34))
-    make_pipe("Aire_Y1", [top, top + Vector((0, 0, 0.35)), Vector((die_rear.x, top.y + 0.1, top.z + 0.35)), Vector((die_rear.x, die_rear.y, top.z + 0.35)), die_rear], mm(4), air, col, fillet=0.08)
-    make_pipe("Aire_Y2", [top, top + Vector((0, 0, 0.45)), Vector((clamp_rear.x, top.y, top.z + 0.45)), Vector((clamp_rear.x, clamp_rear.y, top.z + 0.45)), clamp_rear], mm(4), air, col, fillet=0.08)
-    make_pipe("Aire_Y3", [top, top + Vector((0, 0, 0.55)), Vector((mand.x, top.y, top.z + 0.55)), Vector((mand.x, mand.y, top.z + 0.55)), mand + Vector((0, 0, 0.05))], mm(4), air, col, fillet=0.08)
-    return {"lights": lights, "button": btn, "button_pos": Vector(btn.location), "front": Vector((cx - 0.07, cy_front, cz - 0.04))}
+    a = station["anchors"]
+    die_rear = l2w(a["die"] + u * 0.60)
+    clamp_rear = l2w(a["clamp"] + u * 0.54)
+    mand = l2w((-mm(55), -mm(1000), 0.0))
+    top = Vector((cx, cy, cz + 0.34))
+    for nm, end, zh in (("Aire_Y1", die_rear, 1.90), ("Aire_Y2", clamp_rear, 2.00), ("Aire_Y3", mand, 2.10)):
+        make_pipe(nm, [top, Vector((top.x, top.y, zh)), Vector((end.x, top.y, zh)), Vector((end.x, end.y, zh)), end], mm(4), air, col, fillet=0.08)
+    return {"lights": lights, "button": btn, "button_pos": Vector(btn.location), "front": Vector((cx - 0.07, front, cz - 0.04))}
 
 
 # ---- canastos, rack de caños fríos y mesa de atado ----
-BASKET_A = (1.45, 0.95)  # centro (x, y) del canasto de piezas
-BENCH_C = (1.45, 1.75)
-BASKET_B = (1.45, 2.50)
+BASKET_A = (2.15, -1.20)  # centro (x, y) del canasto de piezas
+BENCH_C = (3.40, -1.00)
+BASKET_B = (3.40, -1.90)
 STACK_DZ = 0.042  # separación vertical entre piezas apiladas
 BASKET_Z = 0.55  # altura del piso de los canastos
 BENCH_Z = 0.90
+RACK_C = (-0.90, -0.30)  # centro del rack de caños fríos (los caños van a lo largo de X)
 
 
 def build_wire_basket(name, center, size, z0, mat, col):
@@ -1205,23 +1198,53 @@ def build_logistics(root, station):
         for ey in (-1, 1):
             add_box(bm, (0.05, 0.05, BENCH_Z - 0.04), (BENCH_C[0] + ex * 0.32, BENCH_C[1] + ey * 0.32, (BENCH_Z - 0.04) / 2))
     finish("Mesa_Atado_Patas", bm, paint, col, smooth=False)
-    # rack de caños fríos: estante con 6 caños azules a lo largo de Y
+    # rack de caños fríos: estante con 5 caños azules a lo largo de X
+    rx, ry = RACK_C
     bm = bmesh.new()
-    rx, ry = 0.57, -1.07
     for ex in (-1, 1):
         for ey in (-1, 1):
-            add_box(bm, (0.05, 0.05, 0.95), (rx + ex * 0.15, ry + ey * 0.40, 0.475))
+            add_box(bm, (0.05, 0.05, 0.95), (rx + ex * 0.40, ry + ey * 0.15, 0.475))
     for z in (0.50, 0.90):
-        add_box(bm, (0.36, 0.90, 0.03), (rx, ry, z))
+        add_box(bm, (0.90, 0.36, 0.03), (rx, ry, z))
     finish("Rack_Canos_Frios", bm, paint, col, smooth=False, bevel=mm(2))
     cold = temp_material("Cano_Frio_Rack", AMBIENT)
     bm = bmesh.new()
     for i in range(3):
-        add_cyl(bm, mm(20), mm(860), (rx - 0.09 + i * 0.09, ry, 0.945), (0, 1, 0), 24)
+        add_cyl(bm, mm(20), mm(860), (rx, ry - 0.09 + i * 0.09, 0.945), (1, 0, 0), 24)
     for i in range(2):
-        add_cyl(bm, mm(20), mm(860), (rx - 0.045 + i * 0.09, ry, 0.985), (0, 1, 0), 24)
+        add_cyl(bm, mm(20), mm(860), (rx, ry - 0.045 + i * 0.09, 0.985), (1, 0, 0), 24)
     finish("Canos_Frios_en_Rack", bm, cold, col)
     return {"col": col, "cold_mat": cold}
+
+
+def build_table(root, station):
+    """Mesa de trabajo (a ras con el borde de la batea): lleva el dispositivo de conformado; el desagote pasa por una ranura hacia el tanque."""
+    col = new_collection("08_Mesa", root)
+    use_parent(None)
+    steel = make_material("Mesa_Acero", (0.62, 0.64, 0.68), metallic=1.0, roughness=0.45)
+    dark = make_material("Agujero_Oscuro", (0.02, 0.02, 0.02), roughness=0.9)
+    x0, x1 = TABLE_X
+    y0, y1 = TABLE_Y
+    bm = bmesh.new()
+    add_box(bm, (x1 - x0, y1 - y0, 0.02), ((x0 + x1) / 2, (y0 + y1) / 2, Z_TOP - 0.01))
+    finish("Mesa_Tablero", bm, steel, col, smooth=False, bevel=mm(2))
+    bm = bmesh.new()  # placa perforada para fijar los dispositivos
+    for i in range(6):
+        for j in range(10):
+            add_cyl(bm, mm(7), mm(1.5), (0.64 + i * 0.07, -0.36 + j * 0.095, Z_TOP + 0.0008), (0, 0, 1), 12)
+    fw = station["stub_world"]
+    add_box(bm, (0.12, 0.28, 0.002), (fw.x, fw.y + 0.05, Z_TOP + 0.001))  # ranura de paso del codo
+    finish("Mesa_Agujeros", bm, dark, col, smooth=False, edge_split=False)
+    bm = bmesh.new()
+    legs = ((x0 + 0.05, y0 + 0.05), (x0 + 0.05, y1 - 0.05), (x1 - 0.05, y0 + 0.05), (x1 - 0.05, y1 - 0.05), (2.05, y0 + 0.05), (2.05, y1 - 0.05))
+    for lx, ly in legs:
+        add_box(bm, (0.05, 0.05, Z_TOP - 0.02), (lx, ly, (Z_TOP - 0.02) / 2))
+    for ly in (y0 + 0.05, y1 - 0.05):
+        add_box(bm, (x1 - x0 - 0.1, 0.04, 0.04), ((x0 + x1) / 2, ly, Z_TOP - 0.03))
+    for lx in (x0 + 0.05, x1 - 0.05):
+        add_box(bm, (0.04, y1 - y0 - 0.1, 0.04), (lx, (y0 + y1) / 2, Z_TOP - 0.03))
+    finish("Mesa_Patas_y_Travesanos", bm, station["mats"]["frame"], col, smooth=False, bevel=mm(2))
+    return {"col": col}
 
 
 def strap_mesh(name, y_local, clear, mat, col):
@@ -1263,7 +1286,7 @@ def build_operator(root):
         "boot": make_material("Op_Botas", (0.05, 0.05, 0.05), roughness=0.5),
     }
     op = Operator()
-    op.root = make_empty("Operario_Raiz", col, (ST_A[0], ST_A[1], 0.0), size=0.2)
+    op.root = make_empty("Operario_Raiz", col, (ST_P0[0], ST_P0[1], 0.0), size=0.2)
     use_parent(op.root)
     bm = bmesh.new()
     add_box(bm, (0.26, 0.40, 0.18), (0, 0, 0.93))
@@ -1445,19 +1468,11 @@ class Cycle:
     pass
 
 
-def lerp3(a, b, k):
-    return tuple(a[i] + (b[i] - a[i]) * k for i in range(3))
+# ---- anclas para manos y poses de objetos (poses = (posición, cuaternión)) ----
+def wrap_pi(a):
+    return (a + pi) % (2 * pi) - pi
 
 
-def root_seg(track, t0, t1, p0, p1):
-    track.add(t0, t1, lambda u, t, p0=p0, p1=p1: lerp3(p0, p1, smoothstep(u)))
-
-
-def root_hold(track, t, p):
-    track.add(t, t + 0.01, lambda u, t_, p=p: p)
-
-
-# ---- anclas para manos y poses de objetos ----
 def A_world(x, y, z):
     v = Vector((x, y, z))
     return lambda t: v
@@ -1476,14 +1491,19 @@ def A_idle(plan, side):
 
 
 def A_grip(plan, pair_fn, side):
-    """Punto de agarre (de dos) más cercano al lado izquierdo/derecho del operario en el instante t."""
+    """Punto de agarre (de dos) para la mano izquierda (side=+1) o derecha (−1): se reparten según el lado del cuerpo."""
 
     def f(t):
         pa, pb = pair_fn(t)
         x, y, yaw = plan.root.at(t)
-        left = Vector((-sin(yaw), cos(yaw), 0.0))
         base = Vector((x, y, 0.0))
-        a_left = (pa - base).dot(left) >= (pb - base).dot(left)
+        left = Vector((-sin(yaw), cos(yaw), 0.0))
+        fwd = Vector((cos(yaw), sin(yaw), 0.0))
+        da, db = (pa - base).dot(left), (pb - base).dot(left)
+        if abs(da - db) < 0.12:  # objeto apuntando hacia adelante: la mano izquierda toma el punto más cercano al cuerpo
+            a_left = (pa - base).dot(fwd) <= (pb - base).dot(fwd)
+        else:
+            a_left = da >= db
         if side > 0:
             return pa if a_left else pb
         return pb if a_left else pa
@@ -1492,11 +1512,11 @@ def A_grip(plan, pair_fn, side):
 
 
 def pair_from_pose(track, la, lb):
-    """Agarres en coordenadas locales la/lb de un objeto con pista de pose (pos, euler)."""
+    """Agarres en coordenadas locales la/lb de un objeto con pista de pose (pos, cuaternión)."""
 
     def f(t):
-        pos, eul = track.at(t)
-        M = Euler(eul, "XYZ").to_matrix()
+        pos, q = track.at(t)
+        M = q.to_matrix()
         return pos + M @ Vector(la), pos + M @ Vector(lb)
 
     return f
@@ -1510,15 +1530,17 @@ def hand_move(track, t0, t1, a, b):
     track.add(t0, t1, lambda u, t, a=a, b=b: a(t).lerp(b(t), smoothstep(u)))
 
 
-def P_const(pos, eul):
+def P_const(pos, q):
     p = Vector(pos)
-    return lambda t: (p, eul)
+    return lambda t: (p, q)
 
 
-def P_root(plan, off, tilt=0.0):
+def P_rootq(plan, off, q):
+    """Pose con la posición pegada al operario (offset en su sistema) y la orientación fija q."""
+
     def f(t):
         x, y, yaw = plan.root.at(t)
-        return Vector((x, y, 0.0)) + Matrix.Rotation(yaw, 3, "Z") @ Vector(off), (tilt, 0.0, yaw)
+        return Vector((x, y, 0.0)) + Matrix.Rotation(yaw, 3, "Z") @ Vector(off), q
 
     return f
 
@@ -1527,7 +1549,7 @@ def pose_seg(track, t0, t1, pa, pb):
     def fn(u, t, pa=pa, pb=pb):
         a, b = pa(t), pb(t)
         k = smoothstep(u)
-        return a[0].lerp(b[0], k), lerp3(a[1], b[1], k)
+        return a[0].lerp(b[0], k), a[1].slerp(b[1], k)
 
     track.add(t0, t1, fn)
 
@@ -1536,22 +1558,50 @@ def pose_follow(track, t0, t1, p):
     track.add(t0, t1, lambda u, t, p=p: p(t))
 
 
-def const_track(pos, eul):
+def const_track(pos, q):
     tr = Track()
-    tr.add(0.0, 1.0, lambda u, t, p=Vector(pos), e=eul: (p, e))
+    tr.add(0.0, 1.0, lambda u, t, p=Vector(pos), q=q: (p, q))
     tr.finalize()
     return tr
 
 
-CARRY = (0.22, 0.0, 1.10)  # caño cargado delante del vientre (sistema del operario)
-GRIP_TUBE = ((-0.06, 0.25, 0.0), (-0.06, -0.25, 0.0))
-GRIP_PIECE = ((-0.06, -0.16, 0.0), (-0.06, -0.38, 0.0))
-PIECE_CARRY = (0.34, 0.28, 1.00)
+# ---- recorridos del operario ----
+def walk(P, t0, t1, p0, p1, yaw0, yaw1=None, face_travel=True, turn=0.25):
+    """Recta de p0 a p1 [(x, y)]: gira hacia el rumbo al salir y hacia yaw1 al llegar. Devuelve el giro final (continuo)."""
+    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+    moving = abs(dx) + abs(dy) > 1e-6
+    yaw_dir = yaw0 + wrap_pi(math.atan2(dy, dx) - yaw0) if (moving and face_travel) else yaw0
+    yaw_end = yaw_dir if yaw1 is None else yaw_dir + wrap_pi(yaw1 - yaw_dir)
+
+    def fn(u, t, p0=p0, p1=p1, y0=yaw0, yd=yaw_dir, ye=yaw_end, w=turn):
+        k = 0.7 * u + 0.3 * smoothstep(u)  # arranque y frenado suaves sin picos de velocidad
+        if u < w:
+            yaw = y0 + (yd - y0) * smoothstep(u / w)
+        elif u > 1.0 - w:
+            yaw = yd + (ye - yd) * smoothstep((u - (1.0 - w)) / w)
+        else:
+            yaw = yd
+        return (p0[0] + (p1[0] - p0[0]) * k, p0[1] + (p1[1] - p0[1]) * k, yaw)
+
+    P.root.add(t0, t1, fn)
+    return yaw_end
+
+
+def root_hold(track, t, p):
+    track.add(t, t + 0.01, lambda u, t_, p=p: p)
+
+
+CARRY_FWD = (0.50, 0.0, 1.05)  # caño llevado hacia adelante (eje en la dirección de la marcha), en el sistema del operario
+GRIP_TUBE = ((0.0, -0.34, 0.0), (0.0, -0.12, 0.0))  # agarres sobre el caño: cerca del extremo (−Y local) que queda del lado del operario
+GRIP_PIECE = ((-0.06, -0.16, 0.0), (-0.06, -0.38, 0.0))  # sobre el tramo recto de la pieza (x local −0,06 = hacia arriba)
+PIECE_OFF = (0.23, 0.18, 1.00)  # pieza formada llevada delante del cuerpo
+BUN_OFF = (0.30, 0.0, 1.00)
+COLD_RACK_POS = (RACK_C[0], RACK_C[1], 0.985)
 
 
 def stack_origin(base_xy, z0, k):
-    """Origen (centro del caño en y=0) de la pieza k apilada, apoyada en un canasto o mesa."""
-    return Vector((base_xy[0] - 0.21, base_xy[1] + 0.18, z0 + 0.03 + k * STACK_DZ))
+    """Origen (centro del caño en y local = 0) de la pieza k apilada: la huella de la pieza queda centrada en el canasto/mesa."""
+    return Vector((base_xy[0] - 0.18, base_xy[1] - 0.22, z0 + 0.03 + k * STACK_DZ))
 
 
 def build_plan(n_pieces):
@@ -1562,9 +1612,15 @@ def build_plan(n_pieces):
     P.pieces = [Track() for _ in range(n_pieces)]
     P.cycles = []
     P.bundles = []
-    root_hold(P.root, 0.0, ST_A)
+    Q_AY = Quaternion((1.0, 0.0, 0.0, 0.0))  # eje del caño a lo largo de Y, sin inclinar
+    Q_SLOT = Euler((G.tilt, 0.0, 0.0), "XYZ").to_quaternion()  # eje a lo largo de Y, con la inclinación del carrusel
+    Q_FLAT = ST_Q  # eje a lo largo de X, apoyado sobre la mesa (orientación de la estación)
+    P.Q_FLAT = Q_FLAT
+    yaw = ST_P0[2]
+    root_hold(P.root, 0.0, ST_P0)
     hand_follow(P.hand_l, 0.0, 0.01, A_idle(P, +1))
     hand_follow(P.hand_r, 0.0, 0.01, A_idle(P, -1))
+    P.yaw = yaw
 
     T = INTRO_S
     prev_pack = False
@@ -1578,85 +1634,89 @@ def build_plan(n_pieces):
         m_pick = (c + 1 - G.pick_j) % SLOTS
         m_load = (c + 1) % SLOTS
         cy.m_pick, cy.m_load = m_pick, m_load
+        yaw = P.yaw
 
-        # ---------- operario: recorrido del ciclo ----------
-        if c > 0 and not prev_pack:
-            root_seg(P.root, T, T + 0.7, ST_BASKET_A, (WP_LANE[0], WP_LANE[1], 0.0))
-            root_seg(P.root, T + 0.7, T + 1.5, (WP_LANE[0], WP_LANE[1], 0.0), ST_A)
-        root_seg(P.root, T + 3.5, T + 5.7, ST_A, ST_B)
-        root_seg(P.root, T + 7.2, T + 7.6, ST_B, ST_PLC)
-        root_seg(P.root, T + 8.0, T + 8.6, ST_PLC, (WP_RACK[0], WP_RACK[1], -pi))
-        root_seg(P.root, T + 8.6, T + 9.7, (WP_RACK[0], WP_RACK[1], -pi), ST_RACK)
-        root_seg(P.root, T + 10.7, T + 11.3, ST_RACK, (WP_RACK[0], WP_RACK[1], -pi))
-        root_seg(P.root, T + 11.3, T + 12.7, (WP_RACK[0], WP_RACK[1], -pi), ST_A)
-        root_seg(P.root, T + 14.2, T + 15.9, ST_A, ST_B)
-        root_seg(P.root, T + 22.8, T + 23.5, ST_B, (WP_LANE[0], WP_LANE[1], 0.0))
-        root_seg(P.root, T + 23.5, T + 24.2, (WP_LANE[0], WP_LANE[1], 0.0), ST_BASKET_A)
+        # ---------- recorrido del operario ----------
+        if c > 0 and not prev_pack:  # desde el canasto hasta el frente del carrusel
+            yaw = walk(P, T, T + 0.6, ST_B[:2], (1.45, -0.78), yaw)  # bordea el canasto y el tablero PLC por el pasillo
+            yaw = walk(P, T + 0.6, T + 1.2, (1.45, -0.78), (1.00, -1.15), yaw)
+            yaw = walk(P, T + 1.2, T + 1.9, (1.00, -1.15), ST_P0[:2], yaw, yaw1=ST_P0[2])
+        yaw = walk(P, rel["pull"][0], rel["pull"][1], ST_P0[:2], ST_P1[:2], yaw, None, face_travel=False)  # da un paso atrás tirando de la vaina
+        yaw = walk(P, rel["carry"][0], rel["carry"][0] + 1.4, ST_P1[:2], (1.20, -1.15), yaw, turn=0.5)
+        yaw = walk(P, rel["carry"][0] + 1.4, rel["carry"][1], (1.20, -1.15), ST_T[:2], yaw, yaw1=ST_T[2], turn=0.4)
+        yaw = walk(P, rel["to_plc"][0], rel["to_plc"][1], ST_T[:2], ST_C[:2], yaw, yaw1=ST_C[2])
+        yaw = walk(P, rel["to_rack"][0], rel["to_rack"][1], ST_C[:2], ST_RACK[:2], yaw, yaw1=ST_RACK[2])
+        yaw = walk(P, rel["to_load"][0], rel["to_load"][1], ST_RACK[:2], ST_L0[:2], yaw, None, face_travel=False)  # camina de costado con el caño
+        yaw = walk(P, rel["load"][0], rel["load"][1], ST_L0[:2], ST_L1[:2], yaw, None, face_travel=False)  # avanza empujando el caño
+        yaw = walk(P, rel["to_table"][0], rel["to_table"][0] + 1.2, ST_L1[:2], (1.55, -1.15), yaw)
+        yaw = walk(P, rel["to_table"][0] + 1.2, rel["to_table"][1], (1.55, -1.15), ST_T[:2], yaw, yaw1=ST_T[2])
+        yaw = walk(P, rel["to_basket"][0], rel["to_basket"][1], ST_T[:2], ST_B[:2], yaw, yaw1=ST_B[2], turn=0.5)
 
-        # ---------- caño caliente: sale del carrusel, va a la matriz ----------
+        # ---------- vaina caliente: sale POR DELANTE del carrusel (axialmente), se apoya en la mesa ----------
         slot_pos = slot_world(m_pick, c + 1)
-        slot_pose = P_const(slot_pos, (G.tilt, 0.0, 0.0))
-        pick_track = Track()
-        pick_track.add(0.0, 1.0, lambda u, t, p=slot_pos, e=(G.tilt, 0.0, 0.0): (p, e))
-        pick_track.finalize()
+        slot_pose = P_const(slot_pos, Q_SLOT)
+        pick_track = const_track(slot_pos, Q_SLOT)
         cy.slot_pos = slot_pos
-        pose_seg(P.hot, rel["swap"], rel["pick_end"], slot_pose, P_root(P, CARRY))
-        pose_follow(P.hot, rel["pick_end"], rel["carry_end"], P_root(P, CARRY))
-        pose_seg(P.hot, rel["carry_end"], rel["place_end"], P_root(P, CARRY), P_const(tuple(STATION_O), (0.0, 0.0, 0.0)))
-        # manos: alcanzar la vaina, seguirla, soltarla y tocar START
+        t_swap = rel["swap"]
+        pose_seg(P.hot, t_swap, rel["pull"][1], slot_pose, P_rootq(P, CARRY_FWD, Q_AY))
+        pose_seg(P.hot, rel["carry"][0], rel["carry"][0] + 1.6, P_rootq(P, CARRY_FWD, Q_AY), P_rootq(P, CARRY_FWD, Q_FLAT))
+        pose_follow(P.hot, rel["carry"][0] + 1.6, rel["carry"][1], P_rootq(P, CARRY_FWD, Q_FLAT))
+        pose_seg(P.hot, rel["place"][0], rel["place"][1], P_rootq(P, CARRY_FWD, Q_FLAT), P_const(tuple(STATION_O), Q_FLAT))
+        # manos: alcanzar el extremo delantero de la vaina, seguirla, soltarla y tocar START
         hand_move(P.hand_l, rel["reach"][0], rel["reach"][1], A_idle(P, +1), A_grip(P, pair_from_pose(pick_track, *GRIP_TUBE), +1))
         hand_move(P.hand_r, rel["reach"][0], rel["reach"][1], A_idle(P, -1), A_grip(P, pair_from_pose(pick_track, *GRIP_TUBE), -1))
         gl = A_grip(P, pair_from_pose(P.hot, *GRIP_TUBE), +1)
         gr = A_grip(P, pair_from_pose(P.hot, *GRIP_TUBE), -1)
-        hand_follow(P.hand_l, rel["swap"], rel["place_end"], gl)
-        hand_follow(P.hand_r, rel["swap"], rel["place_end"], gr)
+        hand_follow(P.hand_l, t_swap, rel["place"][1], gl)
+        hand_follow(P.hand_r, t_swap, rel["place"][1], gr)
         btn = A_world(*STATION_BTN_FRONT)
-        hand_move(P.hand_l, rel["place_end"], rel["place_end"] + 0.6, gl, A_idle(P, +1))
-        hand_move(P.hand_r, rel["press"][0], rel["press"][0] + 0.5, gr, btn)
-        hand_follow(P.hand_r, rel["press"][0] + 0.5, rel["start"], btn)
+        hand_move(P.hand_l, rel["place"][1], rel["place"][1] + 0.4, gl, A_idle(P, +1))
+        hand_move(P.hand_r, rel["place"][1], rel["place"][1] + 0.4, gr, A_idle(P, -1))
+        hand_move(P.hand_r, rel["to_plc"][1] - 0.4, rel["press"][0], A_idle(P, -1), btn)
+        hand_follow(P.hand_r, rel["press"][0], rel["start"], btn)
         hand_move(P.hand_r, rel["start"], rel["start"] + 0.5, btn, A_idle(P, -1))
 
-        # ---------- carga de un caño frío en el carrusel (durante el ciclo de la máquina) ----------
-        cold_rack = P_const((0.57, -1.07, 0.95), (0.0, 0.0, 0.0))
-        cold_track = Track()
-        cold_track.add(0.0, 1.0, lambda u, t, p=Vector((0.57, -1.07, 0.95)): (p, (0.0, 0.0, 0.0)))
-        cold_track.finalize()
+        # ---------- carga de un caño frío en el carrusel, también por delante ----------
+        cold_rack = P_const(COLD_RACK_POS, Q_FLAT)
+        cold_track = const_track(COLD_RACK_POS, Q_FLAT)
         load_pos = slot_world(m_load, c + 1)
-        t_r0, t_r1 = rel["rack"]
-        hand_move(P.hand_l, t_r0, t_r0 + 0.5, A_idle(P, +1), A_grip(P, pair_from_pose(cold_track, *GRIP_TUBE), +1))
-        hand_move(P.hand_r, t_r0, t_r0 + 0.5, A_idle(P, -1), A_grip(P, pair_from_pose(cold_track, *GRIP_TUBE), -1))
-        pose_seg(P.cold, t_r0 + 0.5, t_r1, cold_rack, P_root(P, CARRY))
-        pose_follow(P.cold, t_r1, rel["carry_cold"][1], P_root(P, CARRY))
-        pose_seg(P.cold, rel["load"][0], rel["load"][1], P_root(P, CARRY), P_const(tuple(load_pos), (G.tilt, 0.0, 0.0)))
+        t_tk0, t_tk1 = rel["take"]
+        OFF_ACR = (0.40, 0.0, 1.05)
+        hand_move(P.hand_l, t_tk0, t_tk0 + 0.4, A_idle(P, +1), A_grip(P, pair_from_pose(cold_track, *GRIP_TUBE), +1))
+        hand_move(P.hand_r, t_tk0, t_tk0 + 0.4, A_idle(P, -1), A_grip(P, pair_from_pose(cold_track, *GRIP_TUBE), -1))
+        pose_seg(P.cold, t_tk0 + 0.4, t_tk1, cold_rack, P_rootq(P, OFF_ACR, Q_FLAT))
+        pose_seg(P.cold, rel["to_load"][0], rel["to_load"][1], P_rootq(P, OFF_ACR, Q_FLAT), P_rootq(P, CARRY_FWD, Q_AY))
+        pose_seg(P.cold, rel["load"][0], rel["load"][1], P_rootq(P, CARRY_FWD, Q_AY), P_const(load_pos, Q_SLOT))
         cgl = A_grip(P, pair_from_pose(P.cold, *GRIP_TUBE), +1)
         cgr = A_grip(P, pair_from_pose(P.cold, *GRIP_TUBE), -1)
-        hand_follow(P.hand_l, t_r0 + 0.5, rel["load"][1], cgl)
-        hand_follow(P.hand_r, t_r0 + 0.5, rel["load"][1], cgr)
+        hand_follow(P.hand_l, t_tk0 + 0.4, rel["load"][1], cgl)
+        hand_follow(P.hand_r, t_tk0 + 0.4, rel["load"][1], cgr)
         hand_move(P.hand_l, rel["load"][1], rel["load"][1] + 0.5, cgl, A_idle(P, +1))
         hand_move(P.hand_r, rel["load"][1], rel["load"][1] + 0.5, cgr, A_idle(P, -1))
 
-        # ---------- pieza formada: se retira de la matriz y va al canasto ----------
-        die_pose = const_track(tuple(STATION_O), (0.0, 0.0, 0.0))
-        t_e0, t_e1 = rel["extract"]
-        hand_move(P.hand_l, t_e0 - 0.7, t_e0, A_idle(P, +1), A_grip(P, pair_from_pose(die_pose, *GRIP_PIECE), +1))
-        hand_move(P.hand_r, t_e0 - 0.7, t_e0, A_idle(P, -1), A_grip(P, pair_from_pose(die_pose, *GRIP_PIECE), -1))
+        # ---------- pieza formada: se levanta de la matriz, se saca hacia el operario y va al canasto ----------
+        die_pose = const_track(tuple(STATION_O), Q_FLAT)
+        t_l0, t_l1 = rel["lift"]
+        hand_move(P.hand_l, t_l0 - 0.7, t_l0, A_idle(P, +1), A_grip(P, pair_from_pose(die_pose, *GRIP_PIECE), +1))
+        hand_move(P.hand_r, t_l0 - 0.7, t_l0, A_idle(P, -1), A_grip(P, pair_from_pose(die_pose, *GRIP_PIECE), -1))
         pk = P.pieces[c]
-        pose_seg(pk, t_e0, t_e1, P_const(tuple(STATION_O), (0.0, 0.0, 0.0)), P_root(P, PIECE_CARRY))
-        pose_follow(pk, rel["to_basket"][0], rel["to_basket"][1], P_root(P, PIECE_CARRY))
-        stack_k = c % PACK_EVERY
-        a_org = stack_origin(BASKET_A, BASKET_Z, stack_k)
-        pose_seg(pk, rel["drop"][0], rel["drop"][1], P_root(P, PIECE_CARRY), P_const(tuple(a_org), (0.0, pi / 2, 0.0)))
+        up = Vector(STATION_O) + Vector((0.0, 0.0, 0.08))
+        pose_seg(pk, t_l0, t_l1, P_const(tuple(STATION_O), Q_FLAT), P_const(tuple(up), Q_FLAT))
+        pose_seg(pk, rel["pull_piece"][0], rel["pull_piece"][1], P_const(tuple(up), Q_FLAT), P_rootq(P, PIECE_OFF, Q_FLAT))
+        pose_follow(pk, rel["to_basket"][0], rel["to_basket"][1], P_rootq(P, PIECE_OFF, Q_FLAT))
+        a_org = stack_origin(BASKET_A, BASKET_Z, c % PACK_EVERY)
+        pose_seg(pk, rel["drop"][0], rel["drop"][1], P_rootq(P, PIECE_OFF, Q_FLAT), P_const(tuple(a_org), Q_FLAT))
         pgl = A_grip(P, pair_from_pose(pk, *GRIP_PIECE), +1)
         pgr = A_grip(P, pair_from_pose(pk, *GRIP_PIECE), -1)
-        hand_follow(P.hand_l, t_e0, rel["drop"][1] - 0.2, pgl)
-        hand_follow(P.hand_r, t_e0, rel["drop"][1] - 0.2, pgr)
+        hand_follow(P.hand_l, t_l0, rel["drop"][1] - 0.2, pgl)
+        hand_follow(P.hand_r, t_l0, rel["drop"][1] - 0.2, pgr)
         hand_move(P.hand_l, rel["drop"][1] - 0.2, rel["drop"][1] + 0.3, pgl, A_idle(P, +1))
         hand_move(P.hand_r, rel["drop"][1] - 0.2, rel["drop"][1] + 0.3, pgr, A_idle(P, -1))
         cy.stack_origin = a_org
 
-        end = T + CYCLE_S
+        P.yaw = yaw
         if pack:
-            end = add_pack(P, cy, end, c)
+            end = add_pack(P, cy, T + CYCLE_S, c)
             cy.L = end - T
         else:
             cy.L = max(G.cycle, CYCLE_S)
@@ -1672,12 +1732,14 @@ def build_plan(n_pieces):
     return P
 
 
-STATION_BTN_FRONT = (1.28, -0.54, 1.21)  # posición mundial del botón START (se ajusta en main con el tablero real)
+STATION_BTN_FRONT = (0.53, -0.78, 1.21)  # posición mundial del botón START (main() la ajusta con el tablero real)
 
 
 def add_pack(P, cy, t_d, c):
     """Pausa de la línea: el operario ata el paquete de 10 y lo reserva en el canasto de paquetes. Devuelve el inicio del próximo ciclo."""
     pk = PACK
+    Q_FLAT = P.Q_FLAT
+    yaw = P.yaw
     p_idx = len(P.bundles)
     first = c - (PACK_EVERY - 1)
     g0 = t_d
@@ -1692,54 +1754,52 @@ def add_pack(P, cy, t_d, c):
     bench_org = stack_origin(BENCH_C, BENCH_Z, 0)
     bb_org = stack_origin(BASKET_B, BASKET_Z, 0) + Vector((0, 0, p_idx * 0.45))
     bundle = Track()
-    BUN_CARRY = (0.30, 0.18, 0.95)
-    pose_seg(bundle, g0, g1, P_const(tuple(b_org), (0.0, 0.0, 0.0)), P_root(P, BUN_CARRY))
-    pose_follow(bundle, g1, c1, P_root(P, BUN_CARRY))
-    pose_seg(bundle, c1, p1, P_root(P, BUN_CARRY), P_const(tuple(bench_org), (0.0, 0.0, 0.0)))
-    pose_follow(bundle, p1, tie_end, P_const(tuple(bench_org), (0.0, 0.0, 0.0)))
-    pose_seg(bundle, tie_end, l1, P_const(tuple(bench_org), (0.0, 0.0, 0.0)), P_root(P, BUN_CARRY))
-    pose_follow(bundle, l1, q1, P_root(P, BUN_CARRY))
-    pose_seg(bundle, q1, q2, P_root(P, BUN_CARRY), P_const(tuple(bb_org), (0.0, 0.0, 0.0)))
-    pose_follow(bundle, q2, q2 + 0.01, P_const(tuple(bb_org), (0.0, 0.0, 0.0)))
+    pose_seg(bundle, g0, g1, P_const(tuple(b_org), Q_FLAT), P_rootq(P, BUN_OFF, Q_FLAT))
+    pose_follow(bundle, g1, c1, P_rootq(P, BUN_OFF, Q_FLAT))
+    pose_seg(bundle, c1, p1, P_rootq(P, BUN_OFF, Q_FLAT), P_const(tuple(bench_org), Q_FLAT))
+    pose_follow(bundle, p1, tie_end, P_const(tuple(bench_org), Q_FLAT))
+    pose_seg(bundle, tie_end, l1, P_const(tuple(bench_org), Q_FLAT), P_rootq(P, BUN_OFF, Q_FLAT))
+    pose_follow(bundle, l1, q1, P_rootq(P, BUN_OFF, Q_FLAT))
+    pose_seg(bundle, q1, q2, P_rootq(P, BUN_OFF, Q_FLAT), P_const(tuple(bb_org), Q_FLAT))
+    pose_follow(bundle, q2, q2 + 0.01, P_const(tuple(bb_org), Q_FLAT))
     P.bundles.append({"track": bundle, "g0": g0, "tie": (p1, tie_end), "end": q2, "first": first, "org": bb_org})
     cy.bundle = P.bundles[-1]
 
     def bundle_piece_pose(i):
         def f(u, t):
-            pos, eul = bundle.at(t)
-            return pos + Vector((0, 0, i * STACK_DZ)), (0.0, pi / 2, eul[2])
+            pos, q = bundle.at(t)
+            return pos + Vector((0, 0, i * STACK_DZ)), q
 
         return f
 
     for i in range(PACK_EVERY):
         P.pieces[first + i].add(g0, q2, bundle_piece_pose(i))
-        P.pieces[first + i].add(q2, q2 + 0.01, lambda u, t, p=bb_org + Vector((0, 0, i * STACK_DZ)): (p, (0.0, pi / 2, 0.0)))
+        P.pieces[first + i].add(q2, q2 + 0.01, lambda u, t, p=bb_org + Vector((0, 0, i * STACK_DZ)), q=Q_FLAT: (p, q))
 
-    # --- recorrido y manos ---
-    root_hold(P.root, g0, ST_BASKET_A)
-    root_seg(P.root, g1, c1, ST_BASKET_A, ST_BENCH)
-    root_seg(P.root, l1, q1, ST_BENCH, ST_BASKET_B)
-    root_seg(P.root, q2, q2 + 2.2, ST_BASKET_B, (WP_LANE[0], WP_LANE[1], 0.0))
-    root_seg(P.root, q2 + 2.2, q2 + pk["walk"], (WP_LANE[0], WP_LANE[1], 0.0), ST_A)
+    # --- recorrido: del canasto A a la mesa de atado, al canasto B y de vuelta al carrusel ---
+    root_hold(P.root, g0, ST_B)
+    yaw = walk(P, g1, c1, ST_B[:2], ST_BENCH[:2], yaw, yaw1=ST_BENCH[2], turn=0.5)
+    yaw = walk(P, l1, q1, ST_BENCH[:2], ST_BB[:2], yaw, yaw1=ST_BB[2], turn=0.5)
+    yaw = walk(P, q2, q2 + 2.0, ST_BB[:2], (1.50, -1.65), yaw)
+    yaw = walk(P, q2 + 2.0, q2 + pk["walk"], (1.50, -1.65), ST_P0[:2], yaw, yaw1=ST_P0[2])
+    P.yaw = yaw
 
     def bundle_pair(t):
-        pos, eul = bundle.at(t)
-        R = Matrix.Rotation(eul[2], 3, "Z")
-        return pos + R @ Vector((-0.07, -0.34, 0.20)), pos + R @ Vector((-0.07, -0.12, 0.20))
+        pos, q = bundle.at(t)
+        return pos + Vector((0.15, 0.0, 0.22)), pos + Vector((0.40, 0.0, 0.22))
 
     bl, br = A_grip(P, bundle_pair, +1), A_grip(P, bundle_pair, -1)
     hand_move(P.hand_l, g0, g0 + 0.5, A_idle(P, +1), bl)
     hand_move(P.hand_r, g0, g0 + 0.5, A_idle(P, -1), br)
     hand_follow(P.hand_l, g0 + 0.5, q2, bl)
     hand_follow(P.hand_r, g0 + 0.5, q2, br)
-    # atado: las manos giran alrededor del paquete mientras se colocan dos zunchos
     t_a0 = p1
 
     def tie_hand(side):
         def f(t):
-            pos, eul = bundle.at(t)
+            pos, q = bundle.at(t)
             ph = (t - t_a0) * 5.0
-            return pos + Vector((-0.10 + 0.05 * cos(ph + side * pi / 2), -0.22 + 0.10 * side * sin(ph), 0.20 + 0.04 * sin(ph * 0.5)))
+            return pos + Vector((0.27 + 0.07 * cos(ph + side * pi / 2), 0.10 * side * sin(ph), 0.24 + 0.04 * sin(ph * 0.5)))
 
         return f
 
@@ -1750,7 +1810,7 @@ def add_pack(P, cy, t_d, c):
     hand_move(P.hand_l, q2, q2 + 0.5, bl, A_idle(P, +1))
     hand_move(P.hand_r, q2, q2 + 0.5, br, A_idle(P, -1))
     cy.pack_t = dict(g0=g0, g1=g1, c1=c1, p1=p1, tie_end=tie_end, l1=l1, q1=q1, q2=q2)
-    return q2 + pk["walk"] - REL["index"][1]
+    return q2 + pk["walk"] - REL["reach"][0]  # el siguiente ciclo arranca de modo que su "alcanzar" coincida con la llegada
 
 
 class Plan:
@@ -1831,17 +1891,15 @@ def animate_carousel(plan, bath):
 
 
 def animate_machine(plan, station, bath, tank, plc):
-    """Matrices, mordaza, mandril, vaso, agua, luces del PLC, bomba y la curva Bézier del caño."""
+    """Matrices, mordaza, mandril, codo de desagote, agua, luces del PLC, bomba y la curva Bézier del caño."""
     st = station
     open_vec = st["open_vec"]
     lights = plc["lights"]
-    # estado inicial
     for ob in (st["moving"], st["die_rod"], st["clamp"], st["clamp_rod"]):
         key_loc(ob, 1, open_vec)
     key_loc(st["mandrel"], 1, (0, 0, 0))
-    key_loc(st["cup"], 1, (0, 0, 0))
-    st["water"].scale = (1, 1, 0.001)
-    st["water"].keyframe_insert("scale", frame=1)
+    key_loc(st["elbow"], 1, (0, 0, 0))
+    set_vis(st["water"], 1, False)
     for mat in lights.values():
         set_glow(mat, 0.0, 1)
     plc["button"].keyframe_insert("location", frame=1)
@@ -1866,16 +1924,16 @@ def animate_machine(plan, station, bath, tank, plc):
     for cy in plan.cycles:
         t = cy.t
         c = cy.c
-        # --- visibilidad del caño caliente y de la pieza ---
+        # --- visibilidad del caño caliente (hasta que se levanta) y de la pieza formada ---
         set_vis(hot_ob, F(t["swap"]) - 1, False)
         set_vis(hot_ob, F(t["swap"]), True)
-        set_vis(hot_ob, F(t["extract"][0]), False)
-        set_vis(pieces[c], F(t["extract"][0]) - 1, False)
-        set_vis(pieces[c], F(t["extract"][0]), True)
+        set_vis(hot_ob, F(t["lift"][0]), False)
+        set_vis(pieces[c], F(t["lift"][0]) - 1, False)
+        set_vis(pieces[c], F(t["lift"][0]), True)
         # --- forma y color del caño caliente ---
         pose_tube(hot_sp, ss, 0.0)
         key_tube(hot_sp, F(t["swap"]))
-        key_tube(hot_sp, F(t["place_end"]))
+        key_tube(hot_sp, F(t["place"][1]))
         T_pick = getattr(cy, "pick_temp", GEO.S[-1])
         set_tube_temp(hot_mat, T_pick, frame=F(t["swap"]))
         set_tube_temp(hot_mat, T_pick - 2.0, frame=F(t["start"]))
@@ -1899,7 +1957,7 @@ def animate_machine(plan, station, bath, tank, plc):
                 bp.radius = done[k]
                 if k < 9:
                     bp.keyframe_insert("radius", frame=f)
-        # enfriamiento: decaimiento exponencial hasta DEMOLD_TEMP al terminar el agua+purga
+        # enfriamiento: decaimiento exponencial hasta DEMOLD_TEMP al terminar el agua + purga
         a, b = F(t["water"][0]), F(t["purge"][1])
         t_w = 22.0
         tc0 = T_pick - 4.0
@@ -1932,22 +1990,16 @@ def animate_machine(plan, station, bath, tank, plc):
         for ob in (st["moving"], st["die_rod"]):
             key_loc(ob, a, (0, 0, 0))
             key_loc(ob, b, open_vec)
-        # --- vaso: se llena durante el agua, se vacía, sube para liberar la pieza y vuelve a bajar ---
-        w = st["water"]
-        a = F(t["water"][0])
-        w.scale = (1, 1, 0.02)
-        w.keyframe_insert("scale", frame=a)
-        w.scale = (1, 1, 1.0)
-        w.keyframe_insert("scale", frame=a + int(round(3.0 * FPS)))
-        w.keyframe_insert("scale", frame=F(t["mback"][0]))
-        w.scale = (1, 1, 0.02)
-        w.keyframe_insert("scale", frame=F(t["mback"][0]) + int(round(1.0 * FPS)))
-        a, b = F(t["cup_up"][0]), F(t["cup_up"][1])
-        key_loc(st["cup"], a, (0, 0, 0))
-        key_loc(st["cup"], b, (0, 0, 0.10))
-        a, b = F(t["cup_down"][0]), F(t["cup_down"][1])
-        key_loc(st["cup"], a, (0, 0, 0.10))
-        key_loc(st["cup"], b, (0, 0, 0))
+        # --- codo de desagote: se acopla al extremo del caño, sale el agua hacia el tanque, y se retira para liberar la pieza ---
+        set_vis(st["water"], F(t["water"][0]) + int(round(0.8 * FPS)), True)
+        set_vis(st["water"], F(t["purge"][1]), False)
+        a, b = F(t["elbow_out"][0]), F(t["elbow_out"][1])
+        key_loc(st["elbow"], a, (0, 0, 0))
+        key_loc(st["elbow"], b, (0, 0, 0.10))
+        a, b = F(t["elbow_in"][0]), F(t["elbow_in"][1])
+        key_loc(st["elbow"], a, (0, 0, 0.10))
+        key_loc(st["elbow"], b, (0, 0, 0))
+
         # --- luces del PLC (salidas activas) ---
         def glow(name, t0, t1, level=3.0):
             set_glow(lights[name], 0.0, F(t0) - 1)
@@ -1961,23 +2013,21 @@ def animate_machine(plan, station, bath, tank, plc):
         glow("Y3_MANDRIL", t["mandrel"][0], t["mback"][0])
         glow("K1_BOMBA", t["water"][0], t["water"][1])
         glow("Y4_PURGA", t["purge"][0], t["purge"][1])
-        # botón START: se hunde al tocarlo
         btn = plc["button"]
         p0 = plc["button_pos"]
-        key_loc(btn, F(t["press"][0]) + 8, p0)
+        key_loc(btn, F(t["press"][0]) + 2, p0)
         key_loc(btn, F(t["start"]), p0 + Vector((0, 0.008, 0)))
         key_loc(btn, F(t["start"]) + 6, p0)
         # ventilador de la bomba: gira durante el llenado
         fan = tank["fan"]
         a, b = F(t["water"][0]), F(t["purge"][0])
-        ang = fan.rotation_euler[1]
+        ang = fan.rotation_euler[0]
         for f in range(a, b + 1, 3):
-            fan.rotation_euler = (0, ang + (f - a) * 0.45, 0)
+            fan.rotation_euler = (ang + (f - a) * 0.45, 0, 0)
             fan.keyframe_insert("rotation_euler", frame=f)
-        fan.rotation_euler = (0, ang + (b - a) * 0.45, 0)
+        fan.rotation_euler = (ang + (b - a) * 0.45, 0, 0)
         fan.keyframe_insert("rotation_euler", frame=b + 1)
 
-    # --- las pistas de pose del caño caliente y de las piezas ---
     sample_track(hot_ob, plan.hot)
     for k, pob in enumerate(pieces):
         sample_track(pob, plan.pieces[k])
@@ -2002,9 +2052,10 @@ def animate_cold_tube(plan, logistics):
     bm = bmesh.new()
     add_cyl(bm, mm(PIPE_OD / 2), mm(PIPE_LEN), (0, 0, 0), (0, 1, 0), 32)
     ob = finish("Cano_Frio_en_Mano", bm, cold, logistics["col"])
+    ob.rotation_mode = "QUATERNION"
     set_vis(ob, 1, False)
     for cy in plan.cycles:
-        t0 = cy.t["rack"][0] + 0.5
+        t0 = cy.t["take"][0] + 0.4
         set_vis(ob, F(t0) - 1, False)
         set_vis(ob, F(t0), True)
         set_vis(ob, F(cy.t["load"][1]), False)
@@ -2035,7 +2086,7 @@ def animate_packing(plan, logistics, col):
                 f = f0
                 while True:
                     pos, eul = b["track"].at((f - 1) / FPS)
-                    key_obj(ob, f, pos, (0.0, pi / 2, eul[2]))
+                    key_obj(ob, f, pos, eul)
                     if f >= f1:
                         break
                     f = min(f + SAMPLE_STEP, f1)
@@ -2088,45 +2139,44 @@ class Shot:
         self.t0, self.t1, self.pos0, self.pos1, self.tgt0, self.tgt1, self.text = t0, t1, Vector(pos0), Vector(pos1), Vector(tgt0), Vector(tgt1), text
 
 
-WIDE_POS = (3.4, -4.8, 2.9)
-WIDE_TGT = (1.25, 0.45, 0.95)
+WIDE_POS = (5.2, -5.6, 3.3)
+WIDE_TGT = (1.40, -0.20, 0.90)
 
 
 def build_shots(plan):
     S = []
-    # introducción: vista general y detalle de la batea (nivel de glicerina, resistencias, inclinación)
-    S.append(Shot(0.0, 4.5, (3.6, -5.2, 3.0), (3.0, -4.6, 2.6), WIDE_TGT, WIDE_TGT, "Celda de conformado de curvas conduit PEAD Ø40"))
-    S.append(Shot(4.5, INTRO_S, (-0.2, -2.2, 1.5), (0.6, -2.0, 1.3), (0.0, 0.0, 0.75), (0.1, 0.0, 0.75), "Batea: glicerina a 120 °C; el eje queda sobre el nivel (resistencias Ø55)"))
+    S.append(Shot(0.0, 4.5, (5.6, -6.0, 3.4), (4.6, -5.2, 2.9), WIDE_TGT, WIDE_TGT, "Celda de conformado de curvas conduit PEAD Ø40"))
+    S.append(Shot(4.5, INTRO_S, (-2.0, -1.9, 1.6), (-1.5, -1.5, 1.4), (0.0, 0.0, 0.85), (0.1, 0.0, 0.85), "Batea: glicerina a 120 °C; el eje queda sobre el nivel (resistencias Ø55)"))
     for cy in plan.cycles:
         t = cy.t
         T = cy.T
         if cy.c == 0:
-            S.append(Shot(t["index"][0], t["pick_end"], (1.5, -1.0, 1.45), (1.3, -0.7, 1.35), (0.27, 0.0, 0.98), (0.30, 0.0, 1.0), "1. Avance automático y retiro de la vaina (drena la glicerina)"))
-            S.append(Shot(t["pick_end"], t["place_end"], (0.9, -2.3, 1.6), (1.6, -1.9, 1.5), (1.0, 0.0, 1.1), (1.85, 0.0, 1.05), "2. Traslado y colocación en la matriz"))
-            S.append(Shot(t["press"][0], t["start"] + 0.5, (1.30, 0.0, 1.45), (1.30, -0.1, 1.40), (1.35, -0.55, 1.25), (1.35, -0.55, 1.25), "3. El operario activa el PLC: START"))
-            S.append(Shot(t["start"] + 0.5, t["mandrel"][1], (1.25, -1.5, 1.35), (1.45, -1.3, 1.25), (1.95, -0.05, 1.05), (1.95, -0.1, 1.05), "4. Cierre de matriz, mordaza y avance del mandril"))
-            S.append(Shot(t["mandrel"][1], t["load"][1] + 0.5, (1.2, -1.3, 1.9), (1.0, -1.0, 1.9), (0.5, -0.4, 1.1), (0.15, 0.0, 1.15), "5. Carga de un caño frío en el carrusel"))
-            S.append(Shot(t["load"][1] + 0.5, t["purge"][1], (2.55, -1.15, 1.45), (3.0, -1.2, 1.1), (2.0, 0.1, 1.35), (2.8, -0.2, 0.55), "6. Enfriamiento: bomba, agua y rebalse"))
-            S.append(Shot(t["purge"][1], t["extract"][0] + 0.5, (1.25, -1.5, 1.4), (1.3, -1.2, 1.3), (1.95, 0.0, 1.1), (1.95, 0.0, 1.15), "7. Retroceso del mandril y apertura"))
-            S.append(Shot(t["extract"][0] + 0.5, T + CYCLE_S, (2.6, 0.2, 1.7), (2.5, 0.5, 1.6), (1.35, 0.7, 0.95), (1.4, 0.95, 0.85), "8. Extracción y pieza al canasto"))
+            S.append(Shot(t["index"][0], t["pull"][1], (-1.6, -2.7, 1.5), (-0.9, -2.5, 1.4), (0.27, -0.8, 1.0), (0.27, -0.9, 1.0), "1. Avance automático y retiro de la vaina POR DELANTE"))
+            S.append(Shot(t["pull"][1], t["place"][1], (0.6, -2.6, 1.7), (1.4, -2.3, 1.55), (0.9, -1.0, 1.1), (1.55, -0.2, 1.0), "2. Se apoya sobre la mesa, en la matriz"))
+            S.append(Shot(t["place"][1], t["start"] + 0.5, (0.65, -1.95, 1.55), (0.62, -1.95, 1.5), (0.60, -0.78, 1.25), (0.55, -0.78, 1.25), "3. El operario activa el PLC: START"))
+            S.append(Shot(t["start"] + 0.5, t["mandrel"][1], (0.7, -1.5, 2.0), (1.0, -1.4, 1.9), (1.65, 0.0, 1.0), (1.8, 0.0, 1.0), "4. Cierre de matriz, mordaza y abocardado"))
+            S.append(Shot(t["mandrel"][1], t["load"][1] + 0.6, (-1.3, -2.5, 1.7), (-0.9, -2.4, 1.6), (0.0, -0.9, 1.1), (0.0, -0.6, 1.1), "5. Carga de un caño frío en el carrusel, por delante"))
+            S.append(Shot(t["load"][1] + 0.6, t["purge"][1], (2.4, 1.7, 1.3), (1.1, 1.8, 1.1), (1.50, 0.45, 0.85), (2.1, 0.40, 0.35), "6. Agua por el abocardado: sale por el codo al tanque"))
+            S.append(Shot(t["purge"][1], t["lift"][0] + 0.4, (0.7, -1.5, 2.0), (1.0, -1.4, 1.9), (1.65, 0.0, 1.0), (1.7, 0.0, 1.05), "7. Retroceso del mandril, apertura y codo fuera"))
+            S.append(Shot(t["lift"][0] + 0.4, T + CYCLE_S, (2.6, -2.5, 1.7), (2.5, -2.3, 1.6), (1.9, -0.9, 0.95), (2.1, -1.1, 0.9), "8. Extracción de la pieza y canasto"))
         else:
             S.append(Shot(T, T + CYCLE_S, WIDE_POS, WIDE_POS, WIDE_TGT, WIDE_TGT, f"Pieza {cy.c + 1}"))
         if cy.pack:
             pt = cy.pack_t
-            S.append(Shot(T + CYCLE_S, pt["g1"] + 1.0, (2.6, -0.5, 1.7), (2.5, 0.2, 1.6), (1.3, 0.95, 0.95), (1.3, 1.3, 1.0), f"Pieza {PACK_EVERY}: pausa y armado del paquete de {PACK_EVERY}"))
-            S.append(Shot(pt["g1"] + 1.0, pt["l1"], (2.5, 1.0, 1.6), (2.4, 1.2, 1.5), (1.3, 1.75, 1.0), (1.3, 1.75, 1.05), "Atado del paquete con dos zunchos"))
-            S.append(Shot(pt["l1"], pt["q2"] + 1.0, (2.5, 2.0, 1.6), (2.5, 2.2, 1.5), (1.3, 2.4, 0.95), (1.3, 2.5, 0.9), "Paquete de 10 al canasto de reserva"))
+            S.append(Shot(T + CYCLE_S, pt["c1"], (3.9, -2.6, 1.9), (4.1, -2.2, 1.8), (2.5, -1.0, 1.0), (2.9, -1.0, 1.0), f"Pieza {PACK_EVERY}: pausa de la línea y armado del paquete de {PACK_EVERY}"))
+            S.append(Shot(pt["c1"], pt["l1"], (4.6, -0.3, 1.7), (4.6, -0.5, 1.6), (3.4, -1.0, 1.0), (3.4, -1.0, 1.05), "Atado del paquete con dos zunchos"))
+            S.append(Shot(pt["l1"], pt["q2"] + 1.0, (4.6, -3.2, 1.7), (4.5, -3.0, 1.6), (3.3, -1.7, 0.95), (3.4, -1.9, 0.9), "Paquete de 10 al canasto de reserva"))
             S.append(Shot(pt["q2"] + 1.0, cy.T + cy.L, WIDE_POS, WIDE_POS, WIDE_TGT, WIDE_TGT, "Se reanuda la línea"))
     t_end = plan.t_end
-    S.append(Shot(t_end, t_end + 6.0, (1.4, -0.9, 7.8), (1.4, -0.9, 7.8), (1.4, 0.4, 0.0), (1.4, 0.4, 0.0), "Vista cenital de la celda completa"))
+    S.append(Shot(t_end, t_end + 6.0, (1.6, -1.5, 8.2), (1.6, -1.5, 8.2), (1.6, -0.3, 0.0), (1.6, -0.3, 0.0), "Vista cenital de la celda completa"))
     steps = 12
     for i in range(steps):
         a0, a1 = 2 * pi * i / steps - pi / 2, 2 * pi * (i + 1) / steps - pi / 2
         ta = t_end + 6.0 + 12.0 * i / steps
         tb = t_end + 6.0 + 12.0 * (i + 1) / steps
-        c0 = Vector((1.4 + 6.5 * cos(a0), 0.4 + 6.5 * sin(a0), 3.4))
-        c1 = Vector((1.4 + 6.5 * cos(a1), 0.4 + 6.5 * sin(a1), 3.4))
-        S.append(Shot(ta, tb, c0, c1, (1.4, 0.4, 0.8), (1.4, 0.4, 0.8), "Perspectiva de la secuencia completa"))
+        c0 = Vector((1.6 + 6.5 * cos(a0), -0.3 + 6.5 * sin(a0), 3.4))
+        c1 = Vector((1.6 + 6.5 * cos(a1), -0.3 + 6.5 * sin(a1), 3.4))
+        S.append(Shot(ta, tb, c0, c1, (1.6, -0.3, 0.8), (1.6, -0.3, 0.8), "Perspectiva de la secuencia completa"))
     return S
 
 
@@ -2256,6 +2306,7 @@ def main():
     plc = build_plc(root, station)
     STATION_BTN_FRONT = tuple(plc["front"])
     logistics = build_logistics(root, station)
+    build_table(root, station)
     op = build_operator(root)
     cam_col = build_scene_setup(scene, root)
     cam, tgt = build_camera(scene, cam_col)
@@ -2271,7 +2322,7 @@ def main():
     animate_drips(plan, logistics, logistics["col"])
     if plan.bundles:
         animate_packing(plan, logistics, logistics["col"])
-    state = {"f": None, "x": ST_A[0], "y": ST_A[1], "phase": 0.0}
+    state = {"f": None, "x": ST_P0[0], "y": ST_P0[1], "phase": 0.0}
     f = 1
     while f <= total:
         key_operator(op, f, plan, state)
