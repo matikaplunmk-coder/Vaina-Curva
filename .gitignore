@@ -3,3 +3,4 @@ dist
 *.local
 *.log
 dist-single
+__pycache__/
